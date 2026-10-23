@@ -7,8 +7,8 @@ import uuid
 from pathlib import Path
 
 import plotly.graph_objects as go
-import pydeck as pdk
 import streamlit as st
+import streamlit.components.v1 as components
 
 from db import MODEL, connect, query
 from recall import interpret, notice_from_recall
@@ -111,43 +111,6 @@ def recall_flows(conn, rec, case):
     return origin, flows
 
 
-def us_map_3d(highlight, counts, origin=None, flows=()):
-    """3D map: states extruded by FDA recall count, this recall's states in coral, glowing supplier -> store arcs."""
-    top = max(counts.values() or [1])
-    feats = []
-    for f in GEOJSON["features"]:
-        code = STATES.get(f["properties"]["name"])
-        n, hit = counts.get(code, 0), code in highlight
-        feats.append({**f, "properties": {
-            "name": f["properties"]["name"], "count": n, "elev": 15000 + 170000 * n / top,
-            "status": "this recall shipped here" if hit else "not in this recall",
-            "fill": [217, 119, 87, 200] if hit else [41, 181, 232, int(40 + 100 * n / top)]}})
-    layers = [pdk.Layer(
-        "GeoJsonLayer", {"type": "FeatureCollection", "features": feats}, extruded=True, wireframe=True,
-        get_elevation="properties.elev", get_fill_color="properties.fill", get_line_color=[255, 255, 255, 160],
-        pickable=True, auto_highlight=True, material={"ambient": 0.55, "diffuse": 0.6, "shininess": 40})]
-    if flows:
-        glow = [{**f, "c": f["rgb"] + [70]} for f in flows]
-        core = [{**f, "c": f["rgb"] + [255], "c2": ([255, 220, 220] if f["held"] else [255, 255, 255]) + [255]}
-                for f in flows]
-        arc = dict(get_source_position="from", get_target_position="to", get_height=0.55, great_circle=False)
-        layers += [
-            pdk.Layer("ArcLayer", glow, get_source_color="c", get_target_color="c",
-                      get_width="4 + units / 6", width_min_pixels=10, **arc),
-            pdk.Layer("ArcLayer", core, get_source_color="c", get_target_color="c",
-                      get_width=3, width_min_pixels=3, pickable=True, **arc),
-            pdk.Layer("ScatterplotLayer", [{"pos": origin, "firm": flows[0]["firm"]}], get_position="pos",
-                      get_radius=60000, radius_min_pixels=9, get_fill_color=[20, 33, 61, 255],
-                      stroked=True, get_line_color=[255, 255, 255], line_width_min_pixels=3),
-            pdk.Layer("ScatterplotLayer", core, get_position="to", get_radius=22000, radius_min_pixels=7,
-                      get_fill_color="c", stroked=True, get_line_color=[255, 255, 255], line_width_min_pixels=2,
-                      pickable=True),
-        ]
-    view = pdk.ViewState(latitude=37.8, longitude=-104.5, zoom=4.55, pitch=52, bearing=-8)
-    return pdk.Deck(layers=layers, initial_view_state=view, map_style="light",
-                    tooltip={"html": "<b>{name}{site}</b><br/>{count}{units} {status}<br/>{lot}"})
-
-
 def knowledge_graph(rec, scope, hits, orders, stage=6, flash=None):
     """Notice -> scope -> product -> lots -> stock -> orders. `stage` limits depth for the grow animation;
     `flash` rings the order node that just changed."""
@@ -236,6 +199,169 @@ def typed(lines):
             time.sleep(0.035)
         yield "  \n"
         time.sleep(0.25)
+
+
+LABEL_OFFSETS = {  # keep the clustered California labels readable
+    "Oakland": ([-14, -12], "end"), "San Jose": ([-14, 12], "end"), "Sacramento": ([14, -16], "start"),
+    "Fresno": ([16, 4], "start"), "Los Angeles": ([16, 12], "start"), "Warehouse": ([16, -2], "start"),
+}
+
+
+def animated_map_html(highlight, counts, origin, flows):
+    """deck.gl page: states lit by recall count, shipments animating from supplier to stores, held ones red and still."""
+    top = max(counts.values() or [1])
+    states = {"type": "FeatureCollection", "features": [
+        {**f, "properties": {
+            "name": f["properties"]["name"], "count": counts.get(STATES.get(f["properties"]["name"]), 0),
+            "hit": STATES.get(f["properties"]["name"]) in highlight,
+            "elev": 6000 + 70000 * counts.get(STATES.get(f["properties"]["name"]), 0) / top,
+            "fill": ([226, 120, 86, 235] if STATES.get(f["properties"]["name"]) in highlight else
+                     [46, 120, 190, int(70 + 150 * counts.get(STATES.get(f["properties"]["name"]), 0) / top)])}}
+        for f in GEOJSON["features"]]}
+    sites, labels = {}, []
+    for f in flows:
+        s = sites.setdefault(f["site"], {"pos": f["to"], "units": 0, "held": 0, "lots": [], "rgb": f["rgb"]})
+        s["units"] += f["units"]
+        s["held"] += f["units"] if f["held"] else 0
+        s["lots"].append(f"lot {f['lot']}: {f['status']}")
+        if f["held"]:
+            s["rgb"] = f["rgb"]
+    for name, s in sites.items():
+        short = name.split(" - ")[-1]
+        off, anchor = next((v for k, v in LABEL_OFFSETS.items() if k in name), ([14, 0], "start"))
+        text = f"{short} · {s['held']} held" if s["held"] else f"{short} · {s['units']} units"
+        labels.append({"pos": s["pos"], "text": text, "off": off, "anchor": anchor, "held": bool(s["held"])})
+        s["tip"] = name + "\n" + "\n".join(s["lots"])
+    if origin and flows:
+        labels.append({"pos": origin, "text": flows[0]["firm"].split(" (")[0], "off": [0, -22], "anchor": "middle",
+                       "held": False, "origin": True})
+    data = {"states": states, "origin": origin, "sites": list(sites.values()), "labels": labels,
+            "flows": [{"to": f["to"], "rgb": f["rgb"], "held": f["held"]} for f in flows]}
+    return """<!doctype html><html><head><meta charset="utf-8">
+<script src="https://unpkg.com/deck.gl@8.9.36/dist.min.js"></script>
+<style>html,body{margin:0;height:100%;background:#0B1424;font-family:Helvetica,Arial,sans-serif;overflow:hidden}
+#map{position:absolute;inset:0;background:radial-gradient(ellipse at 50% 20%,#1D3157 0%,#0B1424 70%);border-radius:14px}
+.legend{position:absolute;left:16px;bottom:14px;background:rgba(11,20,36,.82);color:#E8EDF5;border:1px solid #2A3F63;
+border-radius:10px;padding:10px 14px;font-size:12px;line-height:1.9}
+.legend i{display:inline-block;width:22px;height:4px;border-radius:2px;margin-right:8px;vertical-align:middle}
+.title{position:absolute;left:16px;top:12px;color:#C3CCD8;font-size:12px;letter-spacing:2px;text-transform:uppercase}</style>
+</head><body><div id="map"></div>
+<div class="title">Live supply map · RecallOps</div>
+<div class="legend"><div><i style="background:#FF8C42"></i>shipment in motion (awaiting approval)</div>
+<div><i style="background:#29B5E8"></i>safe lot, keeps moving</div><div><i style="background:#D62828"></i>held in Snowflake, stopped</div>
+<div><i style="background:#E27856"></i>states this recall reached</div></div>
+<script>
+const D = """ + json.dumps(data) + """;
+const vp = new deck.WebMercatorViewport({width: innerWidth, height: innerHeight})
+  .fitBounds([[-128.5, 23.5], [-66.0, 50.0]], {padding: 48});
+const view = {longitude: vp.longitude - 1.5, latitude: vp.latitude - 2.5, zoom: vp.zoom - 0.1, pitch: 40, bearing: -3};
+function arc(a, b) {
+  const pts = [], ts = [], n = 60, H = Math.hypot(a[0] - b[0], a[1] - b[1]) * 26000;
+  for (let i = 0; i <= n; i++) { const f = i / n;
+    pts.push([a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, 8000 + Math.sin(Math.PI * f) * H]); ts.push(f * 100); }
+  return {pts, ts};
+}
+const flows = D.origin ? D.flows.map((f, i) => Object.assign({}, f, arc(D.origin, f.to), {phase: i * 23})) : [];
+const LOOP = 150;
+const dg = new deck.DeckGL({container: 'map', initialViewState: view, controller: true,
+  getTooltip: ({object}) => object && (object.tip || (object.properties && (object.properties.name + '\\n' +
+    object.properties.count + ' FDA recalls named this state' + (object.properties.hit ? '\\nthis recall shipped here' : '')))),
+  layers: []});
+function layers(t) {
+  const pulse = 1 + 0.45 * Math.sin(t / 220);
+  return [
+    new deck.GeoJsonLayer({id: 'states', data: D.states, extruded: true, getElevation: f => f.properties.elev,
+      getFillColor: f => f.properties.fill, getLineColor: [150, 190, 235, 110], lineWidthMinPixels: 0.7, stroked: true,
+      pickable: true, autoHighlight: true, highlightColor: [255, 255, 255, 60], material: {ambient: 0.65, diffuse: 0.45}}),
+    new deck.PathLayer({id: 'routes', data: flows, getPath: d => d.pts, widthUnits: 'pixels',
+      getColor: d => d.held ? [214, 40, 40, 235] : d.rgb.concat([60]), getWidth: d => d.held ? 4 : 2}),
+    new deck.TripsLayer({id: 'trips', data: flows.filter(d => !d.held), getPath: d => d.pts, getTimestamps: d => d.ts,
+      getColor: d => d.rgb, widthMinPixels: 6, trailLength: 38, fadeTrail: true, capRounded: true, jointRounded: true,
+      currentTime: (t / 14) % LOOP, updateTriggers: {currentTime: t}}),
+    new deck.ScatterplotLayer({id: 'halo', data: D.sites.filter(s => s.held), getPosition: d => d.pos,
+      getRadius: 30000 * pulse, radiusMinPixels: 12 * pulse, getFillColor: [214, 40, 40, 70], updateTriggers: {getRadius: t}}),
+    new deck.ScatterplotLayer({id: 'sites', data: D.sites, getPosition: d => d.pos, getRadius: 14000, radiusMinPixels: 6,
+      getFillColor: d => d.held ? [214, 40, 40, 255] : [245, 248, 252, 255], stroked: true, getLineColor: d => d.rgb,
+      lineWidthMinPixels: 2.5, pickable: true}),
+    new deck.ScatterplotLayer({id: 'origin', data: D.origin ? [{pos: D.origin, tip: 'Supplier'}] : [],
+      getPosition: d => d.pos, getRadius: 26000 * pulse, radiusMinPixels: 8, getFillColor: [245, 198, 107, 255],
+      stroked: true, getLineColor: [255, 255, 255], lineWidthMinPixels: 2, updateTriggers: {getRadius: t}}),
+    new deck.TextLayer({id: 'labels', data: D.labels, getPosition: d => d.pos, getText: d => d.text, getSize: 13,
+      getColor: d => d.held ? [255, 205, 205] : (d.origin ? [245, 198, 107] : [232, 238, 246]),
+      getPixelOffset: d => d.off, getTextAnchor: d => d.anchor, getAlignmentBaseline: 'center', background: true,
+      getBackgroundColor: [11, 20, 36, 215], backgroundPadding: [6, 3], fontWeight: 700}),
+  ];
+}
+function frame(now) { dg.setProps({layers: layers(now)}); requestAnimationFrame(frame); }
+requestAnimationFrame(frame);
+</script></body></html>"""
+
+
+AUDIT_STYLE = {  # action -> (icon, colour, title)
+    "INTERPRETED": ("🧠", "#D97757", "Claude read the notice"),
+    "APPROVED": ("✅", "#1E6A36", "Holds approved"),
+    "NOTICE_TO_HOLD": ("⏱", "#11729E", "Response time measured"),
+    "ORDER_BLOCKED": ("⛔", "#9B2C22", "Order blocked"),
+    "ORDER_FULFILLED": ("📦", "#1E6A36", "Order fulfilled"),
+}
+
+
+def audit_sentence(kind, d):
+    if kind == "INTERPRETED":
+        return f"Claude ({d.get('model', 'model')}) turned the FDA notice into a structured scope in {d.get('seconds', '?')}s."
+    if kind == "APPROVED":
+        return f"APPROVE_HOLDS placed {d.get('new_holds', 0)} new holds · {d.get('units', d.get('units_held', '?'))} units now frozen."
+    if kind == "NOTICE_TO_HOLD":
+        return f"From reading the notice to approved holds took {d.get('seconds', '?')}s, protecting {d.get('units', '?')} units."
+    if kind == "ORDER_BLOCKED":
+        return f"FULFILL_ORDER refused {d.get('order_id', 'an order')}: it carried held, recalled stock."
+    if kind == "ORDER_FULFILLED":
+        return f"{d.get('order_id', 'An order')} shipped: its lot is outside the recall."
+    return ", ".join(f"{k}: {v}" for k, v in d.items()) or kind.replace("_", " ").lower()
+
+
+def render_audit(case):
+    show_all = st.toggle("Show all activity in Snowflake", value=not case)
+    if case and not show_all:
+        rows = query(conn, """SELECT ACTED_AT, ACTION_TYPE, CASE_ID, ACTOR, DETAIL FROM ACTIONS
+            WHERE CASE_ID = %(c)s OR (ACTION_TYPE LIKE 'ORDER_%%'
+              AND ACTED_AT >= (SELECT MIN(ACTED_AT) FROM ACTIONS WHERE CASE_ID = %(c)s))
+            ORDER BY ACTED_AT""", {"c": case["id"]})
+    else:
+        rows = list(reversed(query(conn, """SELECT ACTED_AT, ACTION_TYPE, CASE_ID, ACTOR, DETAIL FROM ACTIONS
+            ORDER BY ACTED_AT DESC LIMIT 40""")))
+    details = [json.loads(r["DETAIL"]) if isinstance(r["DETAIL"], str) else (r["DETAIL"] or {}) for r in rows]
+    resp = next((d.get("seconds") for r, d in zip(rows, details) if r["ACTION_TYPE"] == "NOTICE_TO_HOLD"), None)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Recorded events", len(rows))
+    k2.metric("Notice → holds", f"{resp:.0f}s" if isinstance(resp, (int, float)) else "—")
+    k3.metric("Orders blocked", sum(r["ACTION_TYPE"] == "ORDER_BLOCKED" for r in rows))
+    k4.metric("Orders fulfilled", sum(r["ACTION_TYPE"] == "ORDER_FULFILLED" for r in rows))
+    if not rows:
+        st.info("Nothing recorded yet for this case.")
+        return
+    t_first = rows[0]["ACTED_AT"]
+    items = []
+    for r, d in zip(rows, details):
+        icon, colour, title = AUDIT_STYLE.get(r["ACTION_TYPE"], ("•", "#6B7280", r["ACTION_TYPE"].replace("_", " ").title()))
+        if r["ACTION_TYPE"].startswith("ORDER_") and d.get("order_id"):
+            title += f" · {d['order_id']}"
+        delta = int((r["ACTED_AT"] - t_first).total_seconds())
+        items.append(f"""<div class="tl-item"><div class="tl-dot" style="background:{colour}">{icon}</div>
+<div class="tl-card" style="border-left-color:{colour}"><div class="tl-head"><b>{html.escape(title)}</b>
+<span>{r['ACTED_AT']:%H:%M:%S} · +{delta}s</span></div><div class="tl-body">{html.escape(audit_sentence(r['ACTION_TYPE'], d))}</div>
+<div class="tl-meta">{pill(r['ACTOR'] or 'system')}{pill(r['CASE_ID'] or 'order check')}{pill('ACTIONS table')}</div></div></div>""")
+    st.markdown("""<style>.tl{position:relative;margin:10px 0 0 8px;padding-left:26px;border-left:2px solid #E7E2D8}
+.tl-item{position:relative;margin:0 0 14px} .tl-dot{position:absolute;left:-46px;top:10px;width:36px;height:36px;border-radius:50%;
+display:flex;align-items:center;justify-content:center;font-size:17px;box-shadow:0 0 0 4px #FFFFFF}
+.tl-card{background:#FFFEFB;border:1px solid #E7E2D8;border-left:5px solid;border-radius:12px;padding:12px 16px;
+box-shadow:0 6px 18px rgba(20,33,61,.06)} .tl-head{display:flex;justify-content:space-between;gap:12px}
+.tl-head b{color:#14213D;font-size:16px} .tl-head span{color:#6B7280;font-size:13px;font-variant-numeric:tabular-nums}
+.tl-body{color:#3D4552;font-size:14.5px;margin:4px 0 8px}</style><div class="tl">""" + "".join(items) + "</div>",
+                unsafe_allow_html=True)
+    with st.expander("Raw ACTIONS rows (as stored in Snowflake)"):
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.caption("Every interpretation, approval and order decision is written to RECALLOPS.APP.ACTIONS.")
 
 
 st.set_page_config(page_title="RecallOps", page_icon="🛑", layout="wide")
@@ -365,8 +491,9 @@ def response_banner():
 
 response_banner()
 
-tab1, tabmap, tab2, tab3, tab4 = st.tabs(
-    ["1 The notice", "2 Where it went", "3 What we found", "4 Lock it down", "5 Audit trail"])
+STEPS = ["1 · The notice", "2 · Where it went", "3 · What we found", "4 · Lock it down", "5 · Audit trail"]
+STEP_HINTS = ["Claude reads the real FDA notice", "Where the recalled product went", "Snowflake traces lots to stock",
+              "Approve holds and test orders", "Everything Snowflake recorded"]
 
 
 @st.cache_data(ttl=600)
@@ -377,8 +504,55 @@ def recall_counts_by_state():
             counts[c] = counts.get(c, 0) + 1
     return counts
 
+
+def go_step(i):
+    st.session_state.step_label = STEPS[i]
+
+
+def next_step(i, label=None, primary=True):
+    if i + 1 < len(STEPS):
+        st.button(label or f"Next: {STEPS[i + 1].split(' · ')[1]} →", type="primary" if primary else "secondary",
+                  on_click=go_step, args=(i + 1,), key=f"next_{i}", use_container_width=True)
+
+
+if st.session_state.get("step_label") not in STEPS:
+    st.session_state.step_label = STEPS[0]
+st.segmented_control("Steps", STEPS, key="step_label", label_visibility="collapsed")
+step = STEPS.index(st.session_state.step_label or STEPS[0])
+st.caption(f"Step {step + 1} of {len(STEPS)} · {STEP_HINTS[step]}")
+
+# ---------- shared state: reviewed scope + matched stock (used by steps 2-5) ----------
+scope, hits, affected, graph_orders = {"upcs": [], "lot_codes": []}, [], [], []
+if case:
+    scope = {
+        "upcs": sorted({digits(u) for u in st.session_state.get("scope_upcs", "").split(",") if digits(u)}),
+        "lot_codes": sorted({l.strip().upper() for l in st.session_state.get("scope_lots", "").split(",") if l.strip()}),
+    }
+    inv = query(conn, """
+        SELECT i.INVENTORY_ID, l.LOCATION_NAME AS LOCATION, i.PRODUCT_NAME AS PRODUCT, i.UPC, i.LOT_CODE AS LOT,
+          i.QUANTITY AS UNITS,
+          CASE WHEN NOT ARRAY_CONTAINS(i.UPC::VARIANT, PARSE_JSON(%(u)s)) THEN NULL
+               WHEN i.LOT_CODE IS NULL THEN 'Needs review: no lot on record'
+               WHEN ARRAY_SIZE(PARSE_JSON(%(l)s)) = 0
+                 OR ARRAY_CONTAINS(UPPER(i.LOT_CODE)::VARIANT, PARSE_JSON(%(l)s)) THEN 'Affected'
+               ELSE 'Not affected: lot outside scope' END AS DECISION,
+          IFF(h.INVENTORY_ID IS NULL, '', 'HELD') AS HOLD
+        FROM INVENTORY i JOIN LOCATIONS l ON l.LOCATION_ID = i.LOCATION_ID
+        LEFT JOIN (SELECT DISTINCT INVENTORY_ID FROM HOLDS) h ON h.INVENTORY_ID = i.INVENTORY_ID
+        ORDER BY DECISION, LOCATION""",
+        {"u": json.dumps(scope["upcs"]), "l": json.dumps(scope["lot_codes"])})
+    hits = [r for r in inv if r["DECISION"]]
+    affected = [r for r in hits if r["DECISION"] == "Affected"]
+    graph_orders = query(conn, "SELECT ORDER_ID, INVENTORY_ID, DESTINATION, STATUS FROM ORDERS ORDER BY ORDER_ID")
+
+
+def need_case():
+    st.info("Start with step 1: let Claude read the notice first.")
+    st.button("← Go to step 1", on_click=go_step, args=(0,), type="primary")
+
+
 # ---------- 1: notice + Claude scope ----------
-with tab1:
+if step == 0:
     left, right = st.columns(2)
     with left, st.container(border=True):
         st.markdown("**Recall notice** " + pill("openFDA · real"), unsafe_allow_html=True)
@@ -402,8 +576,11 @@ with tab1:
             query(conn, "INSERT INTO ACTIONS (CASE_ID, ACTION_TYPE, DETAIL) SELECT %(c)s, 'INTERPRETED', PARSE_JSON(%(d)s)",
                   {"c": case_id, "d": json.dumps({"seconds": round(secs, 1), "model": MODEL})})
             st.session_state.case = {"id": case_id, "out": out, "secs": secs, "t0": t0}
+            st.session_state.scope_upcs = ", ".join(out.get("upcs", []))
+            st.session_state.scope_lots = ", ".join(out.get("lot_codes", []))
             st.session_state.stream_findings = True
             st.session_state.pop("approve_result", None)
+            st.session_state.pop("flash", None)
             st.rerun()
         if case:
             out = case["out"]
@@ -412,35 +589,33 @@ with tab1:
                 st.write_stream(typed(findings_lines(rec, out)))
             else:
                 st.markdown("  \n".join(findings_lines(rec, out)))
-            st.markdown(f"""<div class="ro-kv">
+            with st.expander("Full structured scope and review notes"):
+                st.markdown(f"""<div class="ro-kv">
 <div>Firm</div><div>{html.escape(out.get('firm', ''))}</div>
 <div>Products</div><div>{'<br>'.join(html.escape(p) for p in out.get('product_names', []))}</div>
 <div>UPCs</div><div>{', '.join(html.escape(u) for u in out.get('upcs', [])) or '—'}</div>
 <div>Lots in scope</div><div>{', '.join(html.escape(l) for l in out.get('lot_codes', [])) or 'none stated'}</div>
 <div>Best-by</div><div>{', '.join(html.escape(d) for d in out.get('best_by_dates', []) or []) or '—'}</div>
 <div>Reason</div><div>{html.escape(out.get('reason', ''))}</div></div>""", unsafe_allow_html=True)
-            for a in out.get("ambiguities", []):
-                st.warning(f"Needs review: {a}")
+                for a in out.get("ambiguities", []):
+                    st.warning(f"Needs review: {a}")
             st.caption(f"Case `{case['id']}` · Claude answered in {case['secs']:.1f}s · saved to RECALL_CASES. "
                        "Highlighted text in the notice is Claude's quoted evidence.")
+            next_step(0)
         else:
             st.caption("Claude proposes; nothing is held until a coordinator reviews and approves.")
 
 # ---------- 2: where it went (real FDA distribution data) ----------
-with tabmap:
+elif step == 1:
     shipped = states_in(rec["DISTRIBUTION_PATTERN"])
     counts = recall_counts_by_state()
     n_class1 = query(conn, "SELECT COUNT_IF(CLASSIFICATION = 'Class I') N FROM FDA_RECALLS")[0]["N"]
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("States inferred from FDA distribution text", len(shipped))
+    k1.metric("States this recall reached", len(shipped))
     k2.metric("FDA food recalls in Snowflake", f"{n_total:,}")
     k3.metric("Class I (most dangerous)", f"{n_class1:,}")
-    k4.metric("States inferred across all notices", len(counts))
-    map_scope = None
-    if case:
-        map_scope = {"upcs": sorted({digits(u) for u in case["out"].get("upcs", []) if digits(u)}),
-                     "lot_codes": sorted({l.strip().upper() for l in case["out"].get("lot_codes", []) if l.strip()})}
-    origin, flows = recall_flows(conn, rec, {"scope": map_scope} if map_scope and map_scope["upcs"] else None)
+    k4.metric("States hit by any recall", len(counts))
+    origin, flows = recall_flows(conn, rec, {"scope": scope} if case and scope["upcs"] else None)
     if flows:
         held_u = sum(f["units"] for f in flows if f["held"])
         moving = sum(f["units"] for f in flows if not f["held"])
@@ -448,137 +623,120 @@ with tabmap:
                     pill(f"{len(flows)} shipments into our network", "amber") +
                     (pill(f"{held_u} units stopped", "red") if held_u else "") +
                     pill(f"{moving} units still moving", "green" if held_u else "amber"), unsafe_allow_html=True)
+    components.html(animated_map_html(shipped, counts, origin, flows), height=620)
+    st.caption(f"Coral states: inferred from the FDA distribution text for {rec['RECALL_NUMBER']}. Height and blue: how "
+               f"many of the {n_total:,} FDA recalls named each state. Moving lines: shipments of this product into our "
+               "stores; red lines are held in Snowflake. Store stock is generated demo data.")
     st.markdown("**FDA food recalls per week** — it never stops")
     st.plotly_chart(trends_chart(weekly_recalls(), rec["REPORT_DATE"]), use_container_width=True,
                     config={"displayModeBar": False})
-    st.pydeck_chart(us_map_3d(shipped, counts, origin, flows), use_container_width=True, height=600)
-    st.caption(f"Coral: states inferred for {rec['RECALL_NUMBER']}. Height and blue shade: counts inferred from "
-               f"{n_total:,} FDA distribution patterns. This approximate text parser includes DC and can miss or "
-               "misread locations; the map does not verify shipments or store receipt.")
-    st.markdown(pill("FDA, Dec 2025: recalled infant formula was still on sale at 175+ stores in 36 states", "red"),
-                unsafe_allow_html=True)
+    next_step(1)
 
-if not case:
-    for t in (tab2, tab3, tab4):
-        with t:
-            st.info("Interpret the notice first.")
-    st.stop()
-
-# ---------- 2: review + match ----------
-with tab2:
-    out = case["out"]
-    c1, c2 = st.columns(2)
-    upcs = c1.text_input("UPCs in scope (edit if needed)", ", ".join(out.get("upcs", [])))
-    lots = c2.text_input("Lot codes in scope (empty = every lot of these UPCs)", ", ".join(out.get("lot_codes", [])))
-    scope = {
-        "upcs": sorted({digits(u) for u in upcs.split(",") if digits(u)}),
-        "lot_codes": sorted({l.strip().upper() for l in lots.split(",") if l.strip()}),
-    }
-    inv = query(conn, """
-        SELECT i.INVENTORY_ID, l.LOCATION_NAME AS LOCATION, i.PRODUCT_NAME AS PRODUCT, i.UPC, i.LOT_CODE AS LOT,
-          i.QUANTITY AS UNITS,
-          CASE WHEN NOT ARRAY_CONTAINS(i.UPC::VARIANT, PARSE_JSON(%(u)s)) THEN NULL
-               WHEN i.LOT_CODE IS NULL THEN 'Needs review: no lot on record'
-               WHEN ARRAY_SIZE(PARSE_JSON(%(l)s)) = 0
-                 OR ARRAY_CONTAINS(UPPER(i.LOT_CODE)::VARIANT, PARSE_JSON(%(l)s)) THEN 'Affected'
-               ELSE 'Not affected: lot outside scope' END AS DECISION,
-          IFF(h.INVENTORY_ID IS NULL, '', 'HELD') AS HOLD
-        FROM INVENTORY i JOIN LOCATIONS l ON l.LOCATION_ID = i.LOCATION_ID
-        LEFT JOIN (SELECT DISTINCT INVENTORY_ID FROM HOLDS) h ON h.INVENTORY_ID = i.INVENTORY_ID
-        ORDER BY DECISION, LOCATION""",
-        {"u": json.dumps(scope["upcs"]), "l": json.dumps(scope["lot_codes"])})
-    hits = [r for r in inv if r["DECISION"]]
-    affected = [r for r in hits if r["DECISION"] == "Affected"]
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Affected units", sum(r["UNITS"] for r in affected))
-    m2.metric("Locations", len({r["LOCATION"] for r in affected}))
-    m3.metric("Outside scope (stay sellable)", sum(r["UNITS"] for r in hits if r["DECISION"].startswith("Not")))
-    m4.metric("Needs review", sum(r["DECISION"].startswith("Needs") for r in hits))
-    graph_orders = query(conn, """SELECT o.ORDER_ID, o.INVENTORY_ID, o.DESTINATION, o.STATUS FROM ORDERS o
-                                  ORDER BY o.ORDER_ID""")
-    if hits:
-        g1, g2 = st.columns([5, 1])
-        g1.markdown("**Recall knowledge graph** — notice → reviewed scope → product → lots → stock → orders")
-        trace = g2.button("▶ Trace the recall", use_container_width=True)
-        graph_slot = st.empty()
-        if trace:  # grow the graph one layer at a time
-            for stage in range(1, 7):
-                graph_slot.graphviz_chart(knowledge_graph(rec, scope, hits, graph_orders, stage), use_container_width=True)
-                time.sleep(0.55)
+# ---------- 3: review + match ----------
+elif step == 2:
+    if not case:
+        need_case()
+    else:
+        c1, c2 = st.columns(2)
+        st.session_state.scope_upcs = c1.text_input("UPCs in scope (edit if needed)", st.session_state.get("scope_upcs", ""))
+        st.session_state.scope_lots = c2.text_input("Lot codes in scope (empty = every lot of these UPCs)",
+                                                    st.session_state.get("scope_lots", ""))
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Affected units", sum(r["UNITS"] for r in affected))
+        m2.metric("Locations", len({r["LOCATION"] for r in affected}))
+        m3.metric("Outside scope (stay sellable)", sum(r["UNITS"] for r in hits if r["DECISION"].startswith("Not")))
+        m4.metric("Needs review", sum(r["DECISION"].startswith("Needs") for r in hits))
+        if hits:
+            g1, g2 = st.columns([5, 1])
+            g1.markdown("**Recall knowledge graph** — notice → reviewed scope → product → lots → stock → orders")
+            trace = g2.button("▶ Trace the recall", use_container_width=True)
+            graph_slot = st.empty()
+            if trace:  # grow the graph one layer at a time
+                for stage in range(1, 7):
+                    graph_slot.graphviz_chart(knowledge_graph(rec, scope, hits, graph_orders, stage),
+                                              use_container_width=True)
+                    time.sleep(0.55)
+            else:
+                graph_slot.graphviz_chart(knowledge_graph(rec, scope, hits, graph_orders,
+                                                          flash=st.session_state.get("flash")), use_container_width=True)
+            with st.expander("Matched inventory rows"):
+                st.dataframe(hits, use_container_width=True, hide_index=True)
         else:
-            graph_slot.graphviz_chart(knowledge_graph(rec, scope, hits, graph_orders, flash=st.session_state.get("flash")),
-                                      use_container_width=True)
-        with st.expander("Matched inventory rows"):
-            st.dataframe(hits, use_container_width=True, hide_index=True)
-    if not hits:
-        st.info("No inventory matches these UPCs. That does not prove the stock is safe — check product aliases.")
-    st.caption("Matching runs as SQL in Snowflake against lot-level INVENTORY; Claude never writes SQL.")
+            st.info("No inventory matches these UPCs. That does not prove the stock is safe — check product aliases.")
+        st.caption("Matching runs as SQL in Snowflake against lot-level INVENTORY; Claude never writes SQL.")
+        next_step(2)
 
-# ---------- 3: approve + orders ----------
-with tab3:
-    left, right = st.columns(2)
-    with left, st.container(border=True):
-        st.markdown("**Holds** " + (pill("Approved", "green") if status == "APPROVED" else pill("Pending approval", "amber")),
-                    unsafe_allow_html=True)
-        by_loc = {}
-        for r in affected:
-            by_loc[r["LOCATION"]] = by_loc.get(r["LOCATION"], 0) + r["UNITS"]
-        st.markdown(f"""<div style="display:flex;gap:48px;margin:8px 0 14px">
+# ---------- 4: approve + orders ----------
+elif step == 3:
+    if not case:
+        need_case()
+    else:
+        left, right = st.columns(2)
+        with left, st.container(border=True):
+            st.markdown("**Holds** " + (pill("Approved", "green") if status == "APPROVED" else
+                                        pill("Pending approval", "amber")), unsafe_allow_html=True)
+            by_loc = {}
+            for r in affected:
+                by_loc[r["LOCATION"]] = by_loc.get(r["LOCATION"], 0) + r["UNITS"]
+            st.markdown(f"""<div style="display:flex;gap:48px;margin:8px 0 14px">
 <div><div class="ro-big">{sum(by_loc.values())}</div><div class="ro-biglbl">units to hold</div></div>
 <div><div class="ro-big">{len(by_loc)}</div><div class="ro-biglbl">location tasks</div></div></div>""",
-                    unsafe_allow_html=True)
-        st.dataframe([{"Location": k, "Units": v,
-                       "Action": "Hold + segregation task" if "Warehouse" in k else "Hold + removal task"}
-                      for k, v in by_loc.items()], use_container_width=True, hide_index=True)
-        if st.button(f"Approve holds on {len(affected)} records", type="primary", disabled=not affected,
-                     use_container_width=True):
-            query(conn, "UPDATE RECALL_CASES SET REVIEWED_SCOPE = PARSE_JSON(%(s)s) WHERE CASE_ID = %(c)s",
-                  {"s": json.dumps(scope), "c": case["id"]})
-            st.session_state.approve_result = call("CALL APPROVE_HOLDS(%(c)s)", {"c": case["id"]})
-            if "t0" in case and not st.session_state.get("t_hold"):
-                st.session_state.t_hold = time.time()
-                query(conn, "INSERT INTO ACTIONS (CASE_ID, ACTION_TYPE, DETAIL) SELECT %(c)s, 'NOTICE_TO_HOLD', PARSE_JSON(%(d)s)",
-                      {"c": case["id"], "d": json.dumps({"seconds": round(st.session_state.t_hold - case["t0"], 1),
-                                                          "units": st.session_state.approve_result.get("units_held")})})
-            st.rerun()
-        if st.session_state.get("approve_result"):
-            r = st.session_state.approve_result
-            st.markdown(pill(f"APPROVE_HOLDS: {r['new_holds']} new · {r['total_holds']} total · {r['units_held']} units",
-                             "green") + (pill(f"by {who['U']}", "green") if who.get("U") else ""),
                         unsafe_allow_html=True)
+            st.dataframe([{"Location": k, "Units": v,
+                           "Action": "Hold + segregation task" if "Warehouse" in k else "Hold + removal task"}
+                          for k, v in by_loc.items()], use_container_width=True, hide_index=True)
+            if st.button(f"Approve holds on {len(affected)} records", type="primary", disabled=not affected,
+                         use_container_width=True):
+                query(conn, "UPDATE RECALL_CASES SET REVIEWED_SCOPE = PARSE_JSON(%(s)s) WHERE CASE_ID = %(c)s",
+                      {"s": json.dumps(scope), "c": case["id"]})
+                st.session_state.approve_result = call("CALL APPROVE_HOLDS(%(c)s)", {"c": case["id"]})
+                if "t0" in case and not st.session_state.get("t_hold"):
+                    st.session_state.t_hold = time.time()
+                    query(conn, "INSERT INTO ACTIONS (CASE_ID, ACTION_TYPE, DETAIL) SELECT %(c)s, 'NOTICE_TO_HOLD', "
+                                "PARSE_JSON(%(d)s)",
+                          {"c": case["id"], "d": json.dumps({"seconds": round(st.session_state.t_hold - case["t0"], 1),
+                                                              "units": st.session_state.approve_result.get("units_held")})})
+                st.rerun()
+            if st.session_state.get("approve_result"):
+                r = st.session_state.approve_result
+                st.markdown(pill(f"APPROVE_HOLDS: {r['new_holds']} new · {r['total_holds']} total · {r['units_held']} units",
+                                 "green") + (pill(f"by {who['U']}", "green") if who.get("U") else ""),
+                            unsafe_allow_html=True)
 
-    with right, st.container(border=True):
-        st.markdown("**Order check** — every fulfilment calls `FULFILL_ORDER`, which refuses held stock")
-        upc_set = set(scope["upcs"])
-        orders = query(conn, """
-            SELECT o.ORDER_ID, i.UPC, i.PRODUCT_NAME, i.LOT_CODE, o.QUANTITY, o.DESTINATION, o.STATUS,
-                   l.LOCATION_NAME
-            FROM ORDERS o JOIN INVENTORY i ON i.INVENTORY_ID = o.INVENTORY_ID
-            JOIN LOCATIONS l ON l.LOCATION_ID = i.LOCATION_ID ORDER BY o.ORDER_ID""")
-        orders.sort(key=lambda o: o["UPC"] not in upc_set)  # this recall's product first
-        for o in orders:
-            a, b = st.columns([4, 1])
-            tone = {"BLOCKED": "red", "FULFILLED": "green"}.get(o["STATUS"], "grey")
-            label = {"BLOCKED": "Blocked — recall hold", "FULFILLED": "Fulfilled"}.get(o["STATUS"], "Pending")
-            a.markdown(f"""<div class="ro-order">{o['ORDER_ID']} · lot {html.escape(str(o['LOT_CODE']))} · {o['QUANTITY']} units</div>
+        with right, st.container(border=True):
+            st.markdown("**Order check** — every fulfilment calls `FULFILL_ORDER`, which refuses held stock")
+            upc_set = set(scope["upcs"])
+            orders = query(conn, """
+                SELECT o.ORDER_ID, i.UPC, i.PRODUCT_NAME, i.LOT_CODE, o.QUANTITY, o.DESTINATION, o.STATUS,
+                       l.LOCATION_NAME
+                FROM ORDERS o JOIN INVENTORY i ON i.INVENTORY_ID = o.INVENTORY_ID
+                JOIN LOCATIONS l ON l.LOCATION_ID = i.LOCATION_ID ORDER BY o.ORDER_ID""")
+            orders = [o for o in orders if o["UPC"] in upc_set] or orders  # this recall's orders first
+            for o in orders:
+                a, b = st.columns([4, 1])
+                tone = {"BLOCKED": "red", "FULFILLED": "green"}.get(o["STATUS"], "grey")
+                label = {"BLOCKED": "Blocked — recall hold", "FULFILLED": "Fulfilled"}.get(o["STATUS"], "Pending")
+                a.markdown(f"""<div class="ro-order">{o['ORDER_ID']} · lot {html.escape(str(o['LOT_CODE']))} · {o['QUANTITY']} units</div>
 <div class="ro-ordersub">{html.escape(o['PRODUCT_NAME'][:50])} · {html.escape(o['LOCATION_NAME'])} → {html.escape(o['DESTINATION'])}</div>
 {pill(label, tone)}""", unsafe_allow_html=True)
-            if b.button("Try order", key=o["ORDER_ID"]):
-                call("CALL FULFILL_ORDER(%(o)s)", {"o": o["ORDER_ID"]})
-                st.session_state.flash = o["ORDER_ID"]
-                st.rerun()
+                if b.button("Try order", key=o["ORDER_ID"]):
+                    call("CALL FULFILL_ORDER(%(o)s)", {"o": o["ORDER_ID"]})
+                    st.session_state.flash = o["ORDER_ID"]
+                    st.rerun()
 
-    if hits:
-        st.markdown("**Live recall graph** — order nodes flip the moment Snowflake decides")
-        live_orders = query(conn, "SELECT ORDER_ID, INVENTORY_ID, DESTINATION, STATUS FROM ORDERS ORDER BY ORDER_ID")
-        st.graphviz_chart(knowledge_graph(rec, scope, hits, live_orders, flash=st.session_state.get("flash")),
-                          use_container_width=True)
+        if hits:
+            st.markdown("**Live recall graph** — order nodes flip the moment Snowflake decides")
+            st.graphviz_chart(knowledge_graph(rec, scope, hits, graph_orders, flash=st.session_state.get("flash")),
+                              use_container_width=True)
+        n1, n2 = st.columns(2)
+        with n1:
+            st.button("See the shipments stop on the map", on_click=go_step, args=(1,), use_container_width=True)
+        with n2:
+            next_step(3, "Next: Audit trail →")
 
-# ---------- 4: audit ----------
-with tab4:
-    st.dataframe(query(conn, """SELECT ACTED_AT, ACTION_TYPE, CASE_ID, ACTOR, DETAIL FROM ACTIONS
-                                ORDER BY ACTED_AT DESC LIMIT 100"""), use_container_width=True, hide_index=True)
-    st.caption("Every interpretation, approval and order decision is written to RECALLOPS.APP.ACTIONS.")
+# ---------- 5: audit ----------
+else:
+    render_audit(case)
 
 st.markdown("""<div class="ro-foot"><b>Claude</b> · interpret notice &nbsp;→&nbsp; <b>Snowflake</b> · match records and
 store actions &nbsp;→&nbsp; <b>Coordinator</b> · review and approve · Recall notices are real openFDA data; store stock
