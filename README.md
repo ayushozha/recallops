@@ -27,13 +27,15 @@ When a supplier or the FDA recalls a food product, a grocery chain has to find e
 
 | | Step | Who | What happens |
 |:-:|---|---|---|
-| 1 | **Read the notice** | Claude | `AI_COMPLETE` with a JSON schema extracts UPCs, in-scope lot codes, quoted evidence and ambiguities from a real openFDA notice |
+| 1 | **Read the notice** | Claude | `AI_COMPLETE` extracts UPCs, in-scope lot codes, evidence and ambiguities; the app validates the returned JSON |
 | 2 | **Review the scope** | Coordinator | Evidence is highlighted in the notice; UPCs and lots can be edited before anything changes |
 | 3 | **Match every lot** | Snowflake SQL | The reviewed scope is matched against lot-level inventory: **Affected**, **Outside scope** or **Needs review** (no lot on record — never silently treated as safe) |
 | 4 | **Approve holds** | `APPROVE_HOLDS` | A stored procedure MERGEs holds (re-approval adds nothing) and writes the audit entry |
 | 5 | **Block shipments** | `FULFILL_ORDER` | Every fulfilment checks for holds first — held stock is **BLOCKED**, other lots ship |
 
-Claude proposes, Snowflake decides where, and a person approves. Claude never writes SQL; the notice is treated as data, not instructions.
+Claude proposes, SQL matches records, and a person approves holds. Claude never writes SQL; the notice is treated as data, not instructions. The demo uses the event account's `ATTENDEE_ROLE`; a separate approver role remains future work.
+
+The current UI tabs are **1 The notice**, **2 Where it went**, **3 What we found**, **4 Lock it down** and **5 Audit trail**. The one-minute demo follows tabs 1 → 3 → 4 → 5. The map and graph are optional views added after the core verification; their rendering checks remain pending.
 
 ## Architecture
 
@@ -47,7 +49,7 @@ flowchart LR
         C[(RECALL_CASES)]
         H[(HOLDS)]
         A[(ACTIONS · audit)]
-        AI["Cortex AI_COMPLETE<br/>Claude + JSON schema"]
+        AI["Cortex AI_COMPLETE<br/>Claude + validated JSON"]
         M["SQL lot matching"]
         P1["APPROVE_HOLDS()"]
         P2["FULFILL_ORDER()"]
@@ -64,7 +66,7 @@ flowchart LR
     R --> UI
 ```
 
-Everything — the notices, the model call, the matching, the writes and the audit trail — runs inside the retailer's own Snowflake account. No data leaves it to reach the model.
+Notices, inventory, matching, holds and action history are stored or executed in Snowflake. The app invokes Claude through Cortex rather than a separate Anthropic API connection. The local UI reads results over the Snowflake connection; the hosted Streamlit app has been published, with browser verification pending.
 
 ## Technology
 
@@ -72,7 +74,7 @@ Everything — the notices, the model call, the matching, the writes and the aud
 |---|---|
 | **Claude Opus 5.5** via **Snowflake Cortex `AI_COMPLETE`** | Structured extraction of recall scope with evidence and ambiguities |
 | **Snowflake SQL** | Lot-level matching across inventory, locations and orders |
-| **Snowflake stored procedures** (SQL Scripting) | Governed write-back: idempotent holds and order enforcement |
+| **Snowflake stored procedures** (SQL Scripting) | Reviewed holds, repeat-approval protection and demo order enforcement |
 | **Snowflake tables + VARIANT** | Notices, cases, model output, reviewed scope, holds, audit log |
 | **Streamlit** (local or Streamlit in Snowflake) | The coordinator's workflow UI |
 | **openFDA** `food/enforcement` | Real recall notices, firms, UPCs and lot codes |
@@ -87,11 +89,11 @@ Everything — the notices, the model call, the matching, the writes and the aud
 | **Toolkit** | Structured `AI_COMPLETE` call, SQL matching, constrained procedures |
 | **Intelligence** | Claude interprets free-text scope, exceptions and ambiguity |
 | **Action** | Approved holds written to Snowflake; held orders refused |
-| *Cross-cutting* | Audit trail in `ACTIONS` · end-to-end verifier · human approval before any write |
+| *Cross-cutting* | Audit trail in `ACTIONS` · end-to-end verifier · human approval before holds are written |
 
 ## Data: what is real and what is generated
 
-- **Real:** FDA recall notices from openFDA (the loader fetches up to 2,000 recent reports), including the firms, product descriptions, UPCs and recalled lot codes used in the demo.
+- **Real:** 1,999 unique FDA recall reports loaded into Snowflake from 2,000 fetched records; one record lacked a recall number and was skipped. The firms, descriptions, UPCs and recalled lot codes used in the demo come from these notices.
 - **Generated:** the chain's stock quantities, six locations, pending orders and control lot strings. Each inventory product is a real recalled product with its real UPC and lot; control rows use lot strings outside that notice's scope, and some rows deliberately have no lot code to exercise **Needs review**. Outside-scope strings are not proof that a real lot is safe. A retailer would connect its own inventory and ordering tables.
 
 ## Verification status
@@ -100,9 +102,17 @@ Everything — the notices, the model call, the matching, the writes and the aud
 |---|---|
 | Snowflake connection (event account) | ✅ Verified |
 | Setup SQL: database, tables, procedures | ✅ Created |
-| Claude through `AI_COMPLETE` (`claude-opus-5-5`) | ✅ Probe returned `OK` in 2.4 s |
-| openFDA load into Snowflake | ⏳ In progress |
-| Structured extraction, approval, order blocking | ⏳ Pending the live `verify.py` run |
+| Claude through `AI_COMPLETE` (`claude-opus-5-5`) | ✅ Full recall extraction in 12.1 s |
+| openFDA load into Snowflake | ✅ 1,999 unique reports; 6 locations, 49 inventory rows, 10 orders |
+| Extraction, approval, repeat approval, order decisions and audit | ✅ 15/15 live checks; case `VERIFY-873E22` |
+| Local browser workflow | ✅ Case `CASE-DC8432B8`: 13.2 s extraction, 125 units / 2 stores, approved holds, blocked and fulfilled orders |
+| Hosted Streamlit app | Republished with `SYSTEM$WAREHOUSE_RUNTIME`; browser loading / check pending |
+
+For recall `H-1339-2026`, the verifier created **2 holds for 125 units**, added **0** on repeat approval, left control lots unheld, blocked `O-101` and fulfilled `O-110`. It then removed its holds and restored those orders. [Full verification output](docs/verification-opus-5-5.txt).
+
+Local browser evidence: [Claude notice and evidence](docs/assets/live-opus55-notice.png), [stock matching](docs/assets/live-opus55-stock.png), [holds and order decisions](docs/assets/live-opus55-orders.png).
+
+Opus 5.5 returned SQL `NULL` with native `response_format` in this account. The app retries with a JSON-only prompt and checks all required fields and types before accepting the scope. This fallback passed the live checks; native structured output is not claimed to work for this model.
 
 No time savings or prevented harm are claimed; those need a measured manual baseline.
 
@@ -110,15 +120,17 @@ No time savings or prevented harm are claimed; those need a measured manual base
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install snowflake-connector-python streamlit requests python-dotenv
+.venv/bin/pip install snowflake-connector-python streamlit plotly requests python-dotenv plotly graphviz
 cp .env.example .env          # account, user, token, role, warehouse, model — never commit it
 
 .venv/bin/python scripts/load_data.py                    # create RECALLOPS.APP and load real FDA data
-.venv/bin/python scripts/verify.py --recall H-1339-2026  # live end-to-end check
+.venv/bin/python scripts/verify.py --model claude-opus-5-5 --recall H-1339-2026  # live check
 .venv/bin/streamlit run app/streamlit_app.py             # open http://localhost:8501
 ```
 
 No local login? Paste `scripts/bootstrap_demo.sql` into a Snowsight worksheet: it creates the same objects with 12 selected real notices.
+
+The event account is already loaded. Do not rerun the loader during the demo or while another agent uses the tables; it replaces demo data and history by default.
 
 ## Project structure
 

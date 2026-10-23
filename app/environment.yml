@@ -3,3 +3,6 @@ channels:
   - snowflake
 dependencies:
   - snowflake-snowpark-python
+  - plotly
+  - graphviz
+  - python-graphviz

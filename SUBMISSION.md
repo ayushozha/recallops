@@ -1,26 +1,55 @@
 # Submission text (Cerebral Valley form)
 
-**Project name:** RecallOps
+**Team / project name:** RecallOps
 
-**Tagline:** Turn a real FDA recall notice into reviewed, enforced inventory holds, using Claude to read the notice and Snowflake to act on it.
+**Team members:** Ayush Ojha; agod
 
-**Repository:** https://github.com/ayushozha/recallops
+**Public GitHub repository:** https://github.com/ayushozha/recallops
 
-**Current verification status:** code and the offline FDA-data test are complete. Snowflake loading, a Claude response, approved holds and blocked/fulfilled orders remain pending live verification. No measured operational savings are claimed.
+**1-minute demo video:** Pending
 
-**Description:**
-When a supplier or the FDA recalls a product, a grocery chain has to find every affected lot across its warehouse and stores, stop that stock from moving, and keep a record of what it did. In December 2025 the FDA reported finding recalled infant formula on shelves at more than 175 locations across 36 states. Its findings included confusion about affected product codes and incomplete removal. [FDA recall-effectiveness findings, December 15, 2025](https://www.fda.gov/news-events/press-announcements/fda-takes-action-improve-recall-effectiveness-following-infant-botulism-outbreak-investigation).
+**Project description**
 
-RecallOps is built for the chain's recall coordinator:
+RecallOps helps a grocery chain's recall coordinator turn a food recall notice into reviewed inventory holds and blocked orders. Claude Opus 5.5 extracts product and lot codes with supporting quotes; a person reviews the scope; Snowflake matches stock and records approval and order decisions.
 
-1. The loader fetched 2,000 real openFDA food enforcement reports in an offline test. It can load those reports into Snowflake; an optional browser bootstrap contains 12 selected notices. The app reports the actual loaded count.
-2. The implemented Cortex `AI_COMPLETE` call asks Claude for structured UPCs, lot codes, evidence quotes and ambiguities. A successful live response is still pending.
-3. The coordinator can review and edit that scope before SQL matches it against lot-level inventory. The app distinguishes affected stock, lot strings outside scope and rows with no lot code that need review.
-4. Approval calls the `APPROVE_HOLDS` stored procedure to save holds and an audit entry. Its MERGE is intended to avoid duplicate holds on a repeated approval of the same case; this still needs live verification.
-5. The demo `FULFILL_ORDER` procedure checks for holds before deciding whether to block or fulfill an order. This is demo enforcement, not a connection to a retailer's production ordering system.
+The problem is documented: in December 2025, FDA reported finding recalled infant formula on shelves at more than 175 locations across 36 states. [FDA findings](https://www.fda.gov/news-events/press-announcements/fda-takes-action-improve-recall-effectiveness-following-infant-botulism-outbreak-investigation).
 
-**Built during the hackathon (all of it):** the Snowflake schema and stored procedures, the openFDA loader, the Claude prompt and schema for extracting recall scope, the Streamlit workflow app, and the end-to-end check script.
+**The Value Case**
 
-**Snowflake + Claude:** the architecture uses Snowflake for notices, lot-level inventory, cases, holds and action history. Claude is called through Cortex `AI_COMPLETE` with structured outputs to interpret the unstructured notice. SQL performs matching; stored procedures perform approval and order checks. The Streamlit interface supports a hosted Snowflake session or a local connection. These integrations remain pending live verification.
+The buyer would be a grocery chain's food-safety or operations team. We would measure notice-to-approved-hold time, affected units identified, unnecessary holds and location confirmations against the same coordinator's manual spreadsheet process. That baseline and financial value have not yet been measured.
 
-**What's real and what's generated:** the notices and the selected recalled product identifiers come from real FDA records. Stock quantities, locations, orders and control lot strings are generated. Control strings are outside the selected notice's extracted scope, not independently established as safe. Snowflake writes and Claude calls have not yet been verified live.
+Our live demo check passed 15/15 checks: 125 generated units were held, repeat approval added zero duplicate holds, control lots remained unheld, the affected order was blocked and the control order fulfilled. Another 121 generated units lie outside this notice's lot scope. These are workflow results on demo stock, not proven business savings or prevented harm.
+
+**Architecture Summary**
+
+Snowflake stores 1,999 unique real FDA reports, plus 49 generated inventory rows across 6 locations and 10 orders. One of 2,000 fetched FDA records lacked a recall number and was skipped.
+
+The Streamlit workflow calls Claude Opus 5.5 through Cortex `AI_COMPLETE`. The app validates the resulting JSON, then the coordinator reviews product and lot codes before SQL matching. `APPROVE_HOLDS` saves approved holds; `FULFILL_ORDER` blocks held stock and records order decisions. Native Opus 5.5 `response_format` returned SQL `NULL` in our account, so the working path uses a JSON-only prompt with field/type validation.
+
+The full latest-model verifier passed 15/15 checks; extraction took 12.1 seconds for recall H-1339-2026. The local browser workflow also passed: extraction in 13.2 seconds, 125 units across 2 stores, approved holds and the expected blocked/fulfilled orders. The hosted Streamlit app has been published; its browser check is pending. [Actual verification output](docs/verification-opus-5-5.txt).
+
+**Snowflake account identifier**
+
+`SFSEHOL-ANTHROPIC_SNOWFLAKE_HACKATHON_TADCDR`
+
+**A Short Build Story**
+
+We used Codex and Claude-assisted agents to challenge the problem, build the loader, SQL procedures and Streamlit workflow, and review the verifier. We replaced an initially weak cloud-credit idea with recall coordination. Live testing exposed a missing FDA identifier, duplicated fixtures from overlapping loaders and Opus 5.5's null structured response. We filtered the invalid record, restored unique fixtures, assigned one agent to live testing and added a validated JSON fallback before rerunning all 15 checks successfully.
+
+**Viability**
+
+A retailer's recall coordinator would own the workflow, with its IT team maintaining inventory and ordering connections. The next step is a pilot on approved historical notices and real inventory, compared with the retailer's manual process. Production work includes a separate approver role, store confirmations and integration with actual ordering systems. Current order enforcement is a demo procedure.
+
+**Which partner tools did you use?**
+
+Snowflake SQL, tables, stored procedures, Cortex `AI_COMPLETE`, Streamlit in Snowflake, and Claude Opus 5.5. Codex and Claude-assisted agents supported development and review; openFDA supplied public recall records.
+
+**Feedback on Anthropic and Snowflake products**
+
+Cortex let us invoke the latest Claude model from SQL using the event account's existing role; the complete workflow passed 15 live checks. The main issue was Opus 5.5 returning SQL `NULL` with `response_format` while a plain model call succeeded. A clear unsupported-format error, a model-by-format compatibility table and a validated JSON fallback example would have saved debugging time.
+
+Initial trial/card verification blocked setup; the event-provided account unblocked it. Put that event-account path prominently in the starter guide. A starter that creates one table, runs one model call and publishes a Streamlit app with the correct role and warehouse would make the first successful run faster.
+
+Hosted startup also stalled after the default selected container runtime. Snowflake's 2026_06 change makes that the default when runtime is omitted; our warehouse-based app needs an explicit `RUNTIME_NAME = 'SYSTEM$WAREHOUSE_RUNTIME'`. Show the selected runtime and its compute requirements before creation, and keep starter SQL explicit. Redeployment with warehouse runtime succeeded; the hosted browser check remains pending. [Documented runtime change](https://docs.snowflake.com/en/release-notes/bcr-bundles/2026_06/bcr-2342).
+
+**Data disclosure:** FDA notices and selected recalled product identifiers are real. Stock quantities, locations, orders and control lot strings are generated. An outside-scope control string is not independent proof that a real lot is safe. No financial savings or customer adoption are claimed.

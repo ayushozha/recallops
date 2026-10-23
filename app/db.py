@@ -15,12 +15,10 @@ MODEL = os.getenv("RECALLOPS_MODEL", "claude-opus-5-5")
 
 def connect(*, select_schema=True):
     if not os.getenv("SNOWFLAKE_ACCOUNT"):
-        # Running as Streamlit in Snowflake: reuse the app's own session
+        # The hosted app already has its RECALLOPS.APP context; owner rights forbid USE.
         from snowflake.snowpark.context import get_active_session
 
         conn = get_active_session().connection
-        if select_schema:
-            conn.cursor().execute("USE SCHEMA RECALLOPS.APP")
         return conn
     return snowflake.connector.connect(
         account=os.environ["SNOWFLAKE_ACCOUNT"],

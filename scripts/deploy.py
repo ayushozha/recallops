@@ -46,13 +46,20 @@ def main():
             if not statuses or any(status not in ("UPLOADED", "SKIPPED") for status in statuses):
                 raise RuntimeError("Upload failed for %s: %s" % (path.name, statuses))
             print("Staged", path.name, ", ".join(statuses))
+        # The event account defaults to container runtime (Snowflake BCR-2342).
         query(conn, f"""CREATE OR REPLACE STREAMLIT {APP}
             FROM '{STAGE}' MAIN_FILE = 'streamlit_app.py'
-            QUERY_WAREHOUSE = {warehouse} TITLE = 'RecallOps'""")
+            QUERY_WAREHOUSE = {warehouse}
+            RUNTIME_NAME = 'SYSTEM$WAREHOUSE_RUNTIME' TITLE = 'RecallOps'""")
+        description = query(conn, f"DESC STREAMLIT {APP}")[0]
+        runtime = description.get("runtime_name", description.get("RUNTIME_NAME"))
+        if runtime != "SYSTEM$WAREHOUSE_RUNTIME":
+            raise RuntimeError("Expected warehouse runtime, got %r" % runtime)
         query(conn, f"ALTER STREAMLIT {APP} ADD LIVE VERSION FROM LAST")
         rows = query(conn, "SHOW STREAMLITS LIKE 'RECALLOPS_APP' IN SCHEMA RECALLOPS.APP")
         app = next(row for row in rows if row.get("name", row.get("NAME")) == "RECALLOPS_APP")
         print("Created and published:", APP)
+        print("Runtime:", runtime)
         print("URL ID:", app.get("url_id", app.get("URL_ID")))
         print("Open Snowsight > Projects > Streamlit > RecallOps.")
         print("Deployment does not confirm that the app runs; open it and verify the workflow.")

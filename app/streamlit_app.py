@@ -5,10 +5,94 @@ import re
 import time
 import uuid
 
+import plotly.graph_objects as go
 import streamlit as st
 
 from db import MODEL, connect, query
 from recall import interpret, notice_from_recall
+
+STATES = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA", "Colorado": "CO",
+    "Connecticut": "CT", "Delaware": "DE", "District of Columbia": "DC", "Florida": "FL", "Georgia": "GA",
+    "Hawaii": "HI", "Idaho": "ID", "Illinois": "IL", "Indiana": "IN", "Iowa": "IA", "Kansas": "KS",
+    "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD", "Massachusetts": "MA", "Michigan": "MI",
+    "Minnesota": "MN", "Mississippi": "MS", "Missouri": "MO", "Montana": "MT", "Nebraska": "NE", "Nevada": "NV",
+    "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY", "North Carolina": "NC",
+    "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK", "Oregon": "OR", "Pennsylvania": "PA",
+    "Rhode Island": "RI", "South Carolina": "SC", "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX",
+    "Utah": "UT", "Vermont": "VT", "Virginia": "VA", "Washington": "WA", "West Virginia": "WV",
+    "Wisconsin": "WI", "Wyoming": "WY",
+}
+CODES = set(STATES.values())
+NATIONWIDE = re.compile(r"nation\s*wide|all 50|throughout the (US|U\.S|United States)", re.I)
+
+
+def states_in(distribution):
+    """State codes named in an FDA distribution pattern ('Nationwide' = every state)."""
+    d = distribution or ""
+    if NATIONWIDE.search(d):
+        return set(CODES)
+    found = set(re.findall(r"\b([A-Z]{2})\b", d)) & CODES
+    found |= {code for name, code in STATES.items() if re.search(r"\b" + name + r"\b", d)}
+    return found
+
+
+def us_map(highlight, counts):
+    """Every state shaded by how many FDA recalls reached it; this recall's states in coral."""
+    codes = sorted(CODES)
+    fig = go.Figure(go.Choropleth(
+        locations=codes, z=[counts.get(c, 0) for c in codes], locationmode="USA-states",
+        colorscale=[[0, "#F1EEE8"], [1, "#B9C6D8"]], showscale=False, marker_line_color="#FFFFFF",
+        hovertemplate="%{location}: %{z} FDA recalls reached this state<extra></extra>"))
+    if highlight:
+        hl = sorted(highlight)
+        fig.add_trace(go.Choropleth(
+            locations=hl, z=[1] * len(hl), locationmode="USA-states", showscale=False,
+            colorscale=[[0, "#D97757"], [1, "#D97757"]], marker_line_color="#FFFFFF", marker_line_width=1.5,
+            hovertemplate="%{location}: this recall shipped here<extra></extra>"))
+    fig.update_layout(geo=dict(scope="usa", bgcolor="rgba(0,0,0,0)", lakecolor="rgba(0,0,0,0)"),
+                      margin=dict(l=0, r=0, t=0, b=0), height=440, paper_bgcolor="rgba(0,0,0,0)")
+    return fig
+
+
+def knowledge_graph(rec, scope, hits, orders):
+    """Notice -> Claude scope -> product -> lots -> stock at each location -> orders, coloured by outcome."""
+    q = lambda s: '"' + str(s).replace('"', "'").replace(chr(10), "\\n") + '"'
+    g = ['digraph G { rankdir=LR; bgcolor="transparent"; nodesep=0.25; ranksep=0.6;',
+         'node [shape=box style="rounded,filled" fontname="Helvetica" fontsize=12 penwidth=0 margin="0.18,0.1"];',
+         'edge [color="#9AA5B5" arrowsize=0.7];',
+         f'notice [label={q("FDA notice" + chr(92) + "n" + rec["RECALL_NUMBER"])} fillcolor="#14213D" fontcolor="#FAF8F4"];',
+         f'claude [label={q("Claude scope" + chr(92) + "n" + str(len(scope["upcs"])) + " UPC · " + str(len(scope["lot_codes"])) + " lots")} fillcolor="#D97757" fontcolor="#14213D"];',
+         'notice -> claude;']
+    for u in scope["upcs"]:
+        g += [f'u{u} [label={q("UPC " + u)} fillcolor="#FBEDE6" fontcolor="#14213D"];', f'claude -> u{u};']
+    lots_done = set()
+    for r in hits:
+        inv, lot = r["INVENTORY_ID"], r["LOT"]
+        held, dec = r["HOLD"] == "HELD", r["DECISION"]
+        fill, font, tag = (("#9B2C22", "#FFFFFF", "HELD") if held else
+                           ("#D97757", "#14213D", "affected") if dec == "Affected" else
+                           ("#F5C66B", "#14213D", "needs review") if dec.startswith("Needs") else
+                           ("#E3F4FB", "#0C5A7D", "outside scope"))
+        g.append(f'{q(inv)} [label={q(r["LOCATION"] + chr(10) + str(r["UNITS"]) + " units · " + tag)} fillcolor="{fill}" fontcolor="{font}"];')
+        if lot:
+            lid = "lot_" + re.sub(r"\W", "_", lot)
+            if lid not in lots_done:
+                lots_done.add(lid)
+                in_scope = dec != "Not affected: lot outside scope"
+                g.append(f'{lid} [label={q("Lot " + lot)} shape=ellipse fillcolor="{"#F7D3C4" if in_scope else "#E3F4FB"}" fontcolor="#14213D"];')
+                g.append(f'u{r["UPC"]} -> {lid};')
+            g.append(f'{lid} -> {q(inv)};')
+        else:
+            g.append(f'u{r["UPC"]} -> {q(inv)} [style=dashed label="no lot" fontsize=10 fontcolor="#7A5300"];')
+    hit_ids = {r["INVENTORY_ID"] for r in hits}
+    for o in orders:
+        if o["INVENTORY_ID"] in hit_ids:
+            fill, font = {"BLOCKED": ("#9B2C22", "#FFFFFF"), "FULFILLED": ("#1E6A36", "#FFFFFF")}.get(
+                o["STATUS"], ("#ECEEF2", "#3D4552"))
+            g.append(f'{q(o["ORDER_ID"])} [label={q(o["ORDER_ID"] + chr(10) + o["STATUS"].lower() + " → " + o["DESTINATION"])} shape=note fillcolor="{fill}" fontcolor="{font}"];')
+            g.append(f'{q(o["INVENTORY_ID"])} -> {q(o["ORDER_ID"])};')
+    return "\n".join(g + ["}"])
 
 st.set_page_config(page_title="RecallOps", page_icon="🛑", layout="wide")
 
@@ -107,7 +191,17 @@ h2.markdown("<div style='text-align:right;padding-top:8px'>" + (
     pill("Scope awaiting review", "amber") if case else pill("Not yet interpreted")) + "</div>",
     unsafe_allow_html=True)
 
-tab1, tab2, tab3, tab4 = st.tabs(["1 Notice", "2 Review stock", "3 Approve holds", "4 Audit trail"])
+tab1, tabmap, tab2, tab3, tab4 = st.tabs(
+    ["1 The notice", "2 Where it went", "3 What we found", "4 Lock it down", "5 Audit trail"])
+
+
+@st.cache_data(ttl=600)
+def recall_counts_by_state():
+    counts = {}
+    for r in query(get_conn(), "SELECT DISTRIBUTION_PATTERN D FROM FDA_RECALLS"):
+        for c in states_in(r["D"]):
+            counts[c] = counts.get(c, 0) + 1
+    return counts
 
 # ---------- 1: notice + Claude scope ----------
 with tab1:
@@ -151,6 +245,22 @@ with tab1:
         else:
             st.caption("Claude proposes; nothing is held until a coordinator reviews and approves.")
 
+# ---------- 2: where it went (real FDA distribution data) ----------
+with tabmap:
+    shipped = states_in(rec["DISTRIBUTION_PATTERN"])
+    counts = recall_counts_by_state()
+    n_class1 = query(conn, "SELECT COUNT_IF(CLASSIFICATION = 'Class I') N FROM FDA_RECALLS")[0]["N"]
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("States this recall reached", len(shipped))
+    k2.metric("FDA food recalls in Snowflake", f"{n_total:,}")
+    k3.metric("Class I (most dangerous)", f"{n_class1:,}")
+    k4.metric("States hit by any recall", len(counts))
+    st.plotly_chart(us_map(shipped, counts), use_container_width=True, config={"displayModeBar": False})
+    st.caption(f"Coral: where {rec['RECALL_NUMBER']} was distributed. Blue shading: how many of the "
+               f"{n_total:,} FDA recalls in Snowflake reached each state. Parsed from FDA distribution patterns.")
+    st.markdown(pill("FDA, Dec 2025: recalled infant formula was still on sale at 175+ stores in 36 states", "red"),
+                unsafe_allow_html=True)
+
 if not case:
     for t in (tab2, tab3, tab4):
         with t:
@@ -187,9 +297,14 @@ with tab2:
     m2.metric("Locations", len({r["LOCATION"] for r in affected}))
     m3.metric("Outside scope (stay sellable)", sum(r["UNITS"] for r in hits if r["DECISION"].startswith("Not")))
     m4.metric("Needs review", sum(r["DECISION"].startswith("Needs") for r in hits))
+    graph_orders = query(conn, """SELECT o.ORDER_ID, o.INVENTORY_ID, o.DESTINATION, o.STATUS FROM ORDERS o
+                                  ORDER BY o.ORDER_ID""")
     if hits:
-        st.dataframe(hits, use_container_width=True, hide_index=True)
-    else:
+        st.markdown("**Recall knowledge graph** — notice → Claude's scope → product → lots → stock → orders")
+        st.graphviz_chart(knowledge_graph(rec, scope, hits, graph_orders), use_container_width=True)
+        with st.expander("Matched inventory rows"):
+            st.dataframe(hits, use_container_width=True, hide_index=True)
+    if not hits:
         st.info("No inventory matches these UPCs. That does not prove the stock is safe — check product aliases.")
     st.caption("Matching runs as SQL in Snowflake against lot-level INVENTORY; Claude never writes SQL.")
 
