@@ -125,7 +125,7 @@ No time savings or prevented harm are claimed; those need a measured manual base
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install snowflake-connector-python streamlit plotly requests python-dotenv graphviz
+.venv/bin/pip install snowflake-connector-python streamlit plotly pydeck requests python-dotenv graphviz
 cp .env.example .env          # account, user, token, role, warehouse, model — never commit it
 
 .venv/bin/python scripts/load_data.py                    # create RECALLOPS.APP and load real FDA data

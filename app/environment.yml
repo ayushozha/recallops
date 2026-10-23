@@ -7,3 +7,4 @@ dependencies:
   - plotly
   - graphviz
   - python-graphviz
+  - pydeck

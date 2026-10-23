@@ -4,8 +4,9 @@ import json
 import re
 import time
 import uuid
+from pathlib import Path
 
-import plotly.graph_objects as go
+import pydeck as pdk
 import streamlit as st
 
 from db import MODEL, connect, query
@@ -49,22 +50,27 @@ def states_in(distribution):
     return mentioned(d)
 
 
-def us_map(highlight, counts):
-    """Approximate state mentions in FDA distribution text; selected recall in coral."""
-    codes = sorted(CODES)
-    fig = go.Figure(go.Choropleth(
-        locations=codes, z=[counts.get(c, 0) for c in codes], locationmode="USA-states",
-        colorscale=[[0, "#F1EEE8"], [1, "#B9C6D8"]], showscale=False, marker_line_color="#FFFFFF",
-        hovertemplate="%{location}: inferred in %{z} FDA distribution patterns<extra></extra>"))
-    if highlight:
-        hl = sorted(highlight)
-        fig.add_trace(go.Choropleth(
-            locations=hl, z=[1] * len(hl), locationmode="USA-states", showscale=False,
-            colorscale=[[0, "#D97757"], [1, "#D97757"]], marker_line_color="#FFFFFF", marker_line_width=1.5,
-            hovertemplate="%{location}: inferred from this FDA distribution text<extra></extra>"))
-    fig.update_layout(geo=dict(scope="usa", bgcolor="rgba(0,0,0,0)", lakecolor="rgba(0,0,0,0)"),
-                      margin=dict(l=0, r=0, t=0, b=0), height=440, paper_bgcolor="rgba(0,0,0,0)")
-    return fig
+GEOJSON = json.loads((Path(__file__).parent / "us_states.geojson").read_text())
+
+
+def us_map_3d(highlight, counts):
+    """3D map: each state extruded by how many FDA recalls reached it; this recall's states in coral."""
+    top = max(counts.values() or [1])
+    feats = []
+    for f in GEOJSON["features"]:
+        code = STATES.get(f["properties"]["name"])
+        n, hit = counts.get(code, 0), code in highlight
+        feats.append({**f, "properties": {
+            "name": f["properties"]["name"], "count": n, "elev": 20000 + 230000 * n / top,
+            "status": "this recall shipped here" if hit else "not in this recall",
+            "fill": [217, 119, 87, 235] if hit else [41, 181, 232, int(60 + 120 * n / top)]}})
+    layer = pdk.Layer(
+        "GeoJsonLayer", {"type": "FeatureCollection", "features": feats}, extruded=True, wireframe=True,
+        get_elevation="properties.elev", get_fill_color="properties.fill", get_line_color=[255, 255, 255, 200],
+        pickable=True, auto_highlight=True, material={"ambient": 0.55, "diffuse": 0.6, "shininess": 40})
+    view = pdk.ViewState(latitude=37.2, longitude=-96.0, zoom=4.1, pitch=50, bearing=-10)
+    return pdk.Deck(layers=[layer], initial_view_state=view, map_style="light",
+                    tooltip={"text": "{name}\n{count} FDA recalls reached this state\n{status}"})
 
 
 def knowledge_graph(rec, scope, hits, orders):
@@ -268,8 +274,8 @@ with tabmap:
     k2.metric("FDA food recalls in Snowflake", f"{n_total:,}")
     k3.metric("Class I (most dangerous)", f"{n_class1:,}")
     k4.metric("States inferred across all notices", len(counts))
-    st.plotly_chart(us_map(shipped, counts), use_container_width=True, config={"displayModeBar": False})
-    st.caption(f"Coral: states inferred for {rec['RECALL_NUMBER']}. Blue: counts inferred from "
+    st.pydeck_chart(us_map_3d(shipped, counts), use_container_width=True, height=560)
+    st.caption(f"Coral: states inferred for {rec['RECALL_NUMBER']}. Height and blue shade: counts inferred from "
                f"{n_total:,} FDA distribution patterns. This approximate text parser includes DC and can miss or "
                "misread locations; the map does not verify shipments or store receipt.")
     st.markdown(pill("FDA, Dec 2025: recalled infant formula was still on sale at 175+ stores in 36 states", "red"),
