@@ -53,24 +53,98 @@ def states_in(distribution):
 GEOJSON = json.loads((Path(__file__).parent / "us_states.geojson").read_text())
 
 
-def us_map_3d(highlight, counts):
-    """3D map: each state extruded by how many FDA recalls reached it; this recall's states in coral."""
+def _centroid(geom):
+    rings = [geom["coordinates"][0]] if geom["type"] == "Polygon" else [max((poly[0] for poly in geom["coordinates"]), key=len)]
+    pts = rings[0]
+    return [sum(x for x, _ in pts) / len(pts), sum(y for _, y in pts) / len(pts)]
+
+
+CENTROIDS = {STATES[f["properties"]["name"]]: _centroid(f["geometry"]) for f in GEOJSON["features"]
+             if f["properties"]["name"] in STATES}
+# Map pins for the demo chain's sites (the chain itself is generated demo data)
+SITE_COORDS = {"Oakland": [-122.27, 37.80], "San Jose": [-121.89, 37.34], "Fresno": [-119.79, 36.74],
+               "Sacramento": [-121.49, 38.58], "Los Angeles": [-118.24, 34.05], "Warehouse": [-120.99, 37.64]}
+FLOW_STYLE = {  # status -> (rgb, label)
+    "held": ([214, 40, 40], "HELD: stopped in Snowflake"),
+    "affected": ([255, 140, 66], "affected: awaiting approval"),
+    "review": ([245, 198, 107], "needs review: no lot on record"),
+    "safe": ([41, 181, 232], "safe lot: keeps moving"),
+    "pending": ([255, 140, 66], "stocked: awaiting Claude's scope"),
+}
+
+
+def site_coord(name):
+    return next((c for k, c in SITE_COORDS.items() if k in name), None)
+
+
+def recall_flows(conn, rec, case):
+    """One flow per site holding this recall's product: supplier state -> site, coloured by Snowflake hold state."""
+    raw = rec.get("RAW")
+    raw = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    origin = CENTROIDS.get(raw.get("state"))
+    if not origin:
+        return None, []
+    scope = (case or {}).get("scope")
+    upcs = scope["upcs"] if scope else None
+    lots = set(scope["lot_codes"]) if scope else None
+    rows = query(conn, """
+        SELECT l.LOCATION_NAME, i.LOT_CODE, i.QUANTITY, IFF(h.INVENTORY_ID IS NULL, 0, 1) HELD
+        FROM INVENTORY i JOIN LOCATIONS l ON l.LOCATION_ID = i.LOCATION_ID
+        LEFT JOIN (SELECT DISTINCT INVENTORY_ID FROM HOLDS) h ON h.INVENTORY_ID = i.INVENTORY_ID
+        WHERE """ + ("ARRAY_CONTAINS(i.UPC::VARIANT, PARSE_JSON(%(u)s))" if upcs else "i.SOURCE_RECALL_NUMBER = %(r)s"),
+        {"u": json.dumps(upcs or []), "r": rec["RECALL_NUMBER"]})
+    flows = []
+    for r in rows:
+        dest = site_coord(r["LOCATION_NAME"])
+        if not dest:
+            continue
+        lot = (r["LOT_CODE"] or "").upper()
+        status = ("held" if r["HELD"] else "review" if not lot else "pending" if lots is None
+                  else "affected" if (not lots or lot in lots) else "safe")
+        rgb, label = FLOW_STYLE[status]
+        flows.append({"from": origin, "to": dest, "site": r["LOCATION_NAME"], "lot": lot or "none",
+                      "units": int(r["QUANTITY"]), "status": label, "rgb": rgb, "held": status == "held",
+                      "firm": f"{rec['RECALLING_FIRM']} ({raw.get('city', '')}, {raw.get('state', '')})"})
+    # held/safe flows drawn last so they sit on top
+    flows.sort(key=lambda f: f["held"])
+    return origin, flows
+
+
+def us_map_3d(highlight, counts, origin=None, flows=()):
+    """3D map: states extruded by FDA recall count, this recall's states in coral, glowing supplier -> store arcs."""
     top = max(counts.values() or [1])
     feats = []
     for f in GEOJSON["features"]:
         code = STATES.get(f["properties"]["name"])
         n, hit = counts.get(code, 0), code in highlight
         feats.append({**f, "properties": {
-            "name": f["properties"]["name"], "count": n, "elev": 20000 + 230000 * n / top,
+            "name": f["properties"]["name"], "count": n, "elev": 15000 + 170000 * n / top,
             "status": "this recall shipped here" if hit else "not in this recall",
-            "fill": [217, 119, 87, 235] if hit else [41, 181, 232, int(60 + 120 * n / top)]}})
-    layer = pdk.Layer(
+            "fill": [217, 119, 87, 200] if hit else [41, 181, 232, int(40 + 100 * n / top)]}})
+    layers = [pdk.Layer(
         "GeoJsonLayer", {"type": "FeatureCollection", "features": feats}, extruded=True, wireframe=True,
-        get_elevation="properties.elev", get_fill_color="properties.fill", get_line_color=[255, 255, 255, 200],
-        pickable=True, auto_highlight=True, material={"ambient": 0.55, "diffuse": 0.6, "shininess": 40})
-    view = pdk.ViewState(latitude=37.2, longitude=-96.0, zoom=4.1, pitch=50, bearing=-10)
-    return pdk.Deck(layers=[layer], initial_view_state=view, map_style="light",
-                    tooltip={"text": "{name}\n{count} FDA recalls reached this state\n{status}"})
+        get_elevation="properties.elev", get_fill_color="properties.fill", get_line_color=[255, 255, 255, 160],
+        pickable=True, auto_highlight=True, material={"ambient": 0.55, "diffuse": 0.6, "shininess": 40})]
+    if flows:
+        glow = [{**f, "c": f["rgb"] + [70]} for f in flows]
+        core = [{**f, "c": f["rgb"] + [255], "c2": ([255, 220, 220] if f["held"] else [255, 255, 255]) + [255]}
+                for f in flows]
+        arc = dict(get_source_position="from", get_target_position="to", get_height=0.55, great_circle=False)
+        layers += [
+            pdk.Layer("ArcLayer", glow, get_source_color="c", get_target_color="c",
+                      get_width="4 + units / 6", width_min_pixels=10, **arc),
+            pdk.Layer("ArcLayer", core, get_source_color="c", get_target_color="c",
+                      get_width=3, width_min_pixels=3, pickable=True, **arc),
+            pdk.Layer("ScatterplotLayer", [{"pos": origin, "firm": flows[0]["firm"]}], get_position="pos",
+                      get_radius=60000, radius_min_pixels=9, get_fill_color=[20, 33, 61, 255],
+                      stroked=True, get_line_color=[255, 255, 255], line_width_min_pixels=3),
+            pdk.Layer("ScatterplotLayer", core, get_position="to", get_radius=22000, radius_min_pixels=7,
+                      get_fill_color="c", stroked=True, get_line_color=[255, 255, 255], line_width_min_pixels=2,
+                      pickable=True),
+        ]
+    view = pdk.ViewState(latitude=37.8, longitude=-104.5, zoom=4.55, pitch=52, bearing=-8)
+    return pdk.Deck(layers=layers, initial_view_state=view, map_style="light",
+                    tooltip={"html": "<b>{name}{site}</b><br/>{count}{units} {status}<br/>{lot}"})
 
 
 def knowledge_graph(rec, scope, hits, orders):
@@ -274,7 +348,19 @@ with tabmap:
     k2.metric("FDA food recalls in Snowflake", f"{n_total:,}")
     k3.metric("Class I (most dangerous)", f"{n_class1:,}")
     k4.metric("States inferred across all notices", len(counts))
-    st.pydeck_chart(us_map_3d(shipped, counts), use_container_width=True, height=560)
+    map_scope = None
+    if case:
+        map_scope = {"upcs": sorted({digits(u) for u in case["out"].get("upcs", []) if digits(u)}),
+                     "lot_codes": sorted({l.strip().upper() for l in case["out"].get("lot_codes", []) if l.strip()})}
+    origin, flows = recall_flows(conn, rec, {"scope": map_scope} if map_scope and map_scope["upcs"] else None)
+    if flows:
+        held_u = sum(f["units"] for f in flows if f["held"])
+        moving = sum(f["units"] for f in flows if not f["held"])
+        st.markdown(pill(f"Supplier: {flows[0]['firm']}", "grey") +
+                    pill(f"{len(flows)} shipments into our network", "amber") +
+                    (pill(f"{held_u} units stopped", "red") if held_u else "") +
+                    pill(f"{moving} units still moving", "green" if held_u else "amber"), unsafe_allow_html=True)
+    st.pydeck_chart(us_map_3d(shipped, counts, origin, flows), use_container_width=True, height=600)
     st.caption(f"Coral: states inferred for {rec['RECALL_NUMBER']}. Height and blue shade: counts inferred from "
                f"{n_total:,} FDA distribution patterns. This approximate text parser includes DC and can miss or "
                "misread locations; the map does not verify shipments or store receipt.")
