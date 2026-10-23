@@ -1,14 +1,16 @@
 # One-minute demo script
 
-**Verified:** the full Claude Opus 5.5 / Snowflake check passed **15/15**, case `VERIFY-873E22`; recall extraction took **12.1 seconds**. [Actual output](docs/verification-opus-5-5.txt). The local browser workflow also passed, case `CASE-DC8432B8`, with a **13.2-second** extraction and the expected holds and order decisions. The hosted app still needs its browser check. **Video URL: pending.**
+**Verified:** Opus 5.5 passed **15/15** live verifier checks (12.1-second extraction), the local browser workflow (13.2 seconds) and the hosted browser workflow (11.5 seconds, case `CASE-C2E4E470`). Eleven offline unit checks passed. [Verifier output](docs/verification-opus-5-5.txt), [hosted receipt](docs/hosted-verification.json). **Video URL: pending.**
+
+Record from the [hosted app](https://app.snowflake.com/streamlit/sfsehol/anthropic_snowflake_hackathon_tadcdr/#/apps/RECALLOPS.APP.RECALLOPS_APP) after Snowflake sign-in.
 
 Do not reload the already-prepared account. Open the app and select **H-1339-2026 · Everything Sprouts, LLC**. Its generated fixture contains **125 affected units at 2 stores**, plus **121 units outside this notice's lot scope**. The notice lists lots `222`, `223`, `226`, `230`; the generated control lot is `229`. Approval and both order outcomes passed the live check. The stock figures are demo inputs, not measured business results. This product has no missing-lot row.
 
-Codex reset only local case `CASE-DC8432B8` to `PROPOSED`, removed that case's holds and restored `O-101` / `O-110` to `PENDING`, retaining a `DEMO_RESET` audit entry. Other cases' holds are preserved. A new interpretation can begin the recording; coordinate further state changes with Codex and do not reload shared tables. If a Claude call takes longer than the recording window, use a clearly disclosed cut over the wait.
+**Recording reset confirmed:** H-1339-2026 has **0 holds**, all its cases are `PROPOSED`, and `O-101` / `O-110` are `PENDING`. Cases, audit history and `DEMO_RESET` entries remain; other recalls were untouched. Start a new interpretation and **do not rerun the loader**. The earlier hosted check retried existing order states; the independent verifier proved pending-to-blocked/fulfilled transitions. Disclose any cut over a model wait.
 
 The verified Claude response flagged the notice's UPC check digit and asked about distribution. Keep those warnings visible: this demo matches the identifier printed in the FDA record against generated stock. A retailer must resolve them against its product and supplier records before approving real holds.
 
-Follow tabs **1 The notice → 3 What we found → 4 Lock it down → 5 Audit trail**. Skip **2 Where it went** and the optional graph during the one-minute recording. Their rendering is not covered by the earlier core workflow evidence.
+Follow tabs **1 The notice → 3 What we found → 4 Lock it down → 5 Audit trail**. Skip the optional map and graph during the one-minute recording. The graph rendered in the hosted app; the map still awaits visual inspection.
 
 | Time | Show | Say |
 |---|---|---|

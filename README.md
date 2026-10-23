@@ -23,6 +23,8 @@ When a supplier or the FDA recalls a food product, a grocery chain has to find e
 
 **RecallOps** is built for the person who has to fix that: the **recall coordinator** at a grocery chain or food distributor.
 
+[Open the verified hosted app in Snowflake](https://app.snowflake.com/streamlit/sfsehol/anthropic_snowflake_hackathon_tadcdr/#/apps/RECALLOPS.APP.RECALLOPS_APP) (Snowflake sign-in required).
+
 ## How it works
 
 | | Step | Who | What happens |
@@ -35,7 +37,7 @@ When a supplier or the FDA recalls a food product, a grocery chain has to find e
 
 Claude proposes, SQL matches records, and a person approves holds. Claude never writes SQL; the notice is treated as data, not instructions. The demo uses the event account's `ATTENDEE_ROLE`; a separate approver role remains future work.
 
-The current UI tabs are **1 The notice**, **2 Where it went**, **3 What we found**, **4 Lock it down** and **5 Audit trail**. The one-minute demo follows tabs 1 → 3 → 4 → 5. The map and graph are optional views added after the core verification; their rendering checks remain pending.
+The current UI tabs are **1 The notice**, **2 Where it went**, **3 What we found**, **4 Lock it down** and **5 Audit trail**. The one-minute demo follows tabs 1 → 3 → 4 → 5. The graph rendered in the hosted app; the optional map still awaits visual inspection.
 
 ## Architecture
 
@@ -66,7 +68,7 @@ flowchart LR
     R --> UI
 ```
 
-Notices, inventory, matching, holds and action history are stored or executed in Snowflake. The app invokes Claude through Cortex rather than a separate Anthropic API connection. The local UI reads results over the Snowflake connection; the hosted Streamlit app has been published, with browser verification pending.
+Notices, inventory, matching, holds and action history are stored or executed in Snowflake. The app invokes Claude through Cortex rather than a separate Anthropic API connection. Both the local and hosted Streamlit workflows have passed browser checks.
 
 ## Technology
 
@@ -106,11 +108,14 @@ Notices, inventory, matching, holds and action history are stored or executed in
 | openFDA load into Snowflake | ✅ 1,999 unique reports; 6 locations, 49 inventory rows, 10 orders |
 | Extraction, approval, repeat approval, order decisions and audit | ✅ 15/15 live checks; case `VERIFY-873E22` |
 | Local browser workflow | ✅ Case `CASE-DC8432B8`: 13.2 s extraction, 125 units / 2 stores, approved holds, blocked and fulfilled orders |
-| Hosted Streamlit app | Republished with `SYSTEM$WAREHOUSE_RUNTIME`; browser loading / check pending |
+| Hosted Streamlit app | ✅ Streamlit 1.50 / warehouse runtime; case `CASE-C2E4E470`, 11.5 s extraction, 125 units / 2 stores, approval and order-button checks |
+| Offline unit checks | ✅ 11 passed |
 
 For recall `H-1339-2026`, the verifier created **2 holds for 125 units**, added **0** on repeat approval, left control lots unheld, blocked `O-101` and fulfilled `O-110`. It then removed its holds and restored those orders. [Full verification output](docs/verification-opus-5-5.txt).
 
 Local browser evidence: [Claude notice and evidence](docs/assets/live-opus55-notice.png), [stock matching](docs/assets/live-opus55-stock.png), [holds and order decisions](docs/assets/live-opus55-orders.png).
+
+Hosted evidence: [notice](docs/assets/hosted-opus55-notice.png), [stock](docs/assets/hosted-opus55-stock.png), [orders](docs/assets/hosted-opus55-orders.png), [SQL receipt](docs/hosted-verification.json). Hosted order buttons rechecked existing blocked/fulfilled states and wrote fresh action entries; the CLI verifier separately proved transitions from pending orders. Hosted person-level attribution is unverified because `CURRENT_USER()` returned `NULL`.
 
 Opus 5.5 returned SQL `NULL` with native `response_format` in this account. The app retries with a JSON-only prompt and checks all required fields and types before accepting the scope. This fallback passed the live checks; native structured output is not claimed to work for this model.
 
@@ -120,7 +125,7 @@ No time savings or prevented harm are claimed; those need a measured manual base
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install snowflake-connector-python streamlit plotly requests python-dotenv plotly graphviz
+.venv/bin/pip install snowflake-connector-python streamlit plotly requests python-dotenv graphviz
 cp .env.example .env          # account, user, token, role, warehouse, model — never commit it
 
 .venv/bin/python scripts/load_data.py                    # create RECALLOPS.APP and load real FDA data

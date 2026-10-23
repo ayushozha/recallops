@@ -1,5 +1,6 @@
 """Snowflake connection shared by the app and scripts. Reads credentials from .env."""
 import os
+import re
 from pathlib import Path
 
 import snowflake.connector
@@ -33,5 +34,17 @@ def connect(*, select_schema=True):
 
 def query(conn, sql, params=None):
     cur = conn.cursor(snowflake.connector.DictCursor)
-    cur.execute(sql, params or {})
+    if not params:
+        cur.execute(sql)
+    elif not conn.is_pyformat and isinstance(params, dict):
+        # Snowpark's hosted connection uses qmark bindings, unlike the local connector.
+        bindings = []
+
+        def bind(match):
+            bindings.append(params[match.group(1)])
+            return "?"
+
+        cur.execute(re.sub(r"%\((\w+)\)s", bind, sql), bindings)
+    else:
+        cur.execute(sql, params)
     return cur.fetchall()

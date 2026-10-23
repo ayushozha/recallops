@@ -28,28 +28,40 @@ NATIONWIDE = re.compile(r"nation\s*wide|all 50|throughout the (US|U\.S|United St
 
 
 def states_in(distribution):
-    """State codes named in an FDA distribution pattern ('Nationwide' = every state)."""
+    """Approximate state mentions, with explicit nationwide exclusions honored."""
     d = distribution or ""
+    names = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in sorted(STATES, key=len, reverse=True)) + r")\b", re.I)
+    by_name = {name.lower(): code for name, code in STATES.items()}
+
+    def mentioned(text):
+        found = {by_name[m.group().lower()] for m in names.finditer(text)}
+        remaining = names.sub(" ", text)
+        codes = set(re.findall(r"\b([A-Z]{2})\b", remaining)) & CODES
+        # IN is also a common preposition. Accept its abbreviation only as a
+        # standalone/list item; the full name Indiana is always recognized.
+        if not re.search(r"(?:^|[,:;/])\s*IN\s*(?:$|[,;/])", remaining):
+            codes.discard("IN")
+        return found | codes
+
     if NATIONWIDE.search(d):
-        return set(CODES)
-    found = set(re.findall(r"\b([A-Z]{2})\b", d)) & CODES
-    found |= {code for name, code in STATES.items() if re.search(r"\b" + name + r"\b", d)}
-    return found
+        excluded = re.search(r"\b(?:except|excluding)\b(.*)$", d, re.I | re.S)
+        return set(CODES) - (mentioned(excluded.group(1)) if excluded else set())
+    return mentioned(d)
 
 
 def us_map(highlight, counts):
-    """Every state shaded by how many FDA recalls reached it; this recall's states in coral."""
+    """Approximate state mentions in FDA distribution text; selected recall in coral."""
     codes = sorted(CODES)
     fig = go.Figure(go.Choropleth(
         locations=codes, z=[counts.get(c, 0) for c in codes], locationmode="USA-states",
         colorscale=[[0, "#F1EEE8"], [1, "#B9C6D8"]], showscale=False, marker_line_color="#FFFFFF",
-        hovertemplate="%{location}: %{z} FDA recalls reached this state<extra></extra>"))
+        hovertemplate="%{location}: inferred in %{z} FDA distribution patterns<extra></extra>"))
     if highlight:
         hl = sorted(highlight)
         fig.add_trace(go.Choropleth(
             locations=hl, z=[1] * len(hl), locationmode="USA-states", showscale=False,
             colorscale=[[0, "#D97757"], [1, "#D97757"]], marker_line_color="#FFFFFF", marker_line_width=1.5,
-            hovertemplate="%{location}: this recall shipped here<extra></extra>"))
+            hovertemplate="%{location}: inferred from this FDA distribution text<extra></extra>"))
     fig.update_layout(geo=dict(scope="usa", bgcolor="rgba(0,0,0,0)", lakecolor="rgba(0,0,0,0)"),
                       margin=dict(l=0, r=0, t=0, b=0), height=440, paper_bgcolor="rgba(0,0,0,0)")
     return fig
@@ -62,7 +74,7 @@ def knowledge_graph(rec, scope, hits, orders):
          'node [shape=box style="rounded,filled" fontname="Helvetica" fontsize=12 penwidth=0 margin="0.18,0.1"];',
          'edge [color="#9AA5B5" arrowsize=0.7];',
          f'notice [label={q("FDA notice" + chr(92) + "n" + rec["RECALL_NUMBER"])} fillcolor="#14213D" fontcolor="#FAF8F4"];',
-         f'claude [label={q("Claude scope" + chr(92) + "n" + str(len(scope["upcs"])) + " UPC · " + str(len(scope["lot_codes"])) + " lots")} fillcolor="#D97757" fontcolor="#14213D"];',
+         f'claude [label={q("Reviewed scope" + chr(92) + "n" + str(len(scope["upcs"])) + " UPC · " + str(len(scope["lot_codes"])) + " lots")} fillcolor="#D97757" fontcolor="#14213D"];',
          'notice -> claude;']
     for u in scope["upcs"]:
         g += [f'u{u} [label={q("UPC " + u)} fillcolor="#FBEDE6" fontcolor="#14213D"];', f'claude -> u{u};']
@@ -76,7 +88,7 @@ def knowledge_graph(rec, scope, hits, orders):
                            ("#E3F4FB", "#0C5A7D", "outside scope"))
         g.append(f'{q(inv)} [label={q(r["LOCATION"] + chr(10) + str(r["UNITS"]) + " units · " + tag)} fillcolor="{fill}" fontcolor="{font}"];')
         if lot:
-            lid = "lot_" + re.sub(r"\W", "_", lot)
+            lid = "lot_" + (str(r["UPC"]) + "\0" + str(lot)).encode("utf-8").hex()
             if lid not in lots_done:
                 lots_done.add(lid)
                 in_scope = dec != "Not affected: lot outside scope"
@@ -151,11 +163,12 @@ def call(sql, params):
 
 conn = get_conn()
 who = query(conn, "SELECT CURRENT_USER() U, CURRENT_ROLE() R, CURRENT_ACCOUNT() A")[0]
+session_label = " · ".join(html.escape(str(who[k])) for k in ("A", "U", "R") if who.get(k))
 
 st.markdown(f"""
 <div class="ro-top">
   <div class="ro-logo"><span>R</span>RecallOps</div>
-  <div class="ro-who">Live Snowflake · {html.escape(who['A'])} · {html.escape(who['U'])} ({html.escape(who['R'])})<br>
+  <div class="ro-who">Live Snowflake · {session_label}<br>
   Claude via Cortex <code>AI_COMPLETE</code> · <code>{html.escape(MODEL)}</code></div>
 </div>""", unsafe_allow_html=True)
 
@@ -251,13 +264,14 @@ with tabmap:
     counts = recall_counts_by_state()
     n_class1 = query(conn, "SELECT COUNT_IF(CLASSIFICATION = 'Class I') N FROM FDA_RECALLS")[0]["N"]
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("States this recall reached", len(shipped))
+    k1.metric("States inferred from FDA distribution text", len(shipped))
     k2.metric("FDA food recalls in Snowflake", f"{n_total:,}")
     k3.metric("Class I (most dangerous)", f"{n_class1:,}")
-    k4.metric("States hit by any recall", len(counts))
+    k4.metric("States inferred across all notices", len(counts))
     st.plotly_chart(us_map(shipped, counts), use_container_width=True, config={"displayModeBar": False})
-    st.caption(f"Coral: where {rec['RECALL_NUMBER']} was distributed. Blue shading: how many of the "
-               f"{n_total:,} FDA recalls in Snowflake reached each state. Parsed from FDA distribution patterns.")
+    st.caption(f"Coral: states inferred for {rec['RECALL_NUMBER']}. Blue: counts inferred from "
+               f"{n_total:,} FDA distribution patterns. This approximate text parser includes DC and can miss or "
+               "misread locations; the map does not verify shipments or store receipt.")
     st.markdown(pill("FDA, Dec 2025: recalled infant formula was still on sale at 175+ stores in 36 states", "red"),
                 unsafe_allow_html=True)
 
@@ -300,7 +314,7 @@ with tab2:
     graph_orders = query(conn, """SELECT o.ORDER_ID, o.INVENTORY_ID, o.DESTINATION, o.STATUS FROM ORDERS o
                                   ORDER BY o.ORDER_ID""")
     if hits:
-        st.markdown("**Recall knowledge graph** — notice → Claude's scope → product → lots → stock → orders")
+        st.markdown("**Recall knowledge graph** — notice → reviewed scope → product → lots → stock → orders")
         st.graphviz_chart(knowledge_graph(rec, scope, hits, graph_orders), use_container_width=True)
         with st.expander("Matched inventory rows"):
             st.dataframe(hits, use_container_width=True, hide_index=True)
@@ -333,7 +347,8 @@ with tab3:
         if st.session_state.get("approve_result"):
             r = st.session_state.approve_result
             st.markdown(pill(f"APPROVE_HOLDS: {r['new_holds']} new · {r['total_holds']} total · {r['units_held']} units",
-                             "green") + pill(f"by {who['U']}", "green"), unsafe_allow_html=True)
+                             "green") + (pill(f"by {who['U']}", "green") if who.get("U") else ""),
+                        unsafe_allow_html=True)
 
     with right, st.container(border=True):
         st.markdown("**Order check** — every fulfilment calls `FULFILL_ORDER`, which refuses held stock")

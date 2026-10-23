@@ -1,0 +1,63 @@
+{
+  "case": [
+    {
+      "CASE_ID": "CASE-C2E4E470",
+      "RECALL_NUMBER": "H-1339-2026",
+      "MODEL": "claude-opus-5-5",
+      "STATUS": "APPROVED",
+      "CREATED_AT": "2026-10-23 16:18:29.108000"
+    }
+  ],
+  "holds": [
+    {
+      "RECORDS": 2,
+      "UNITS": 125
+    }
+  ],
+  "orders": [
+    {
+      "ORDER_ID": "O-101",
+      "STATUS": "BLOCKED",
+      "UPDATED_AT": "2026-10-23 16:19:52.619000"
+    },
+    {
+      "ORDER_ID": "O-110",
+      "STATUS": "FULFILLED",
+      "UPDATED_AT": "2026-10-23 16:20:23.748000"
+    }
+  ],
+  "case_actions": [
+    {
+      "ACTION_TYPE": "INTERPRETED",
+      "ACTED_AT": "2026-10-23 16:18:29.855000",
+      "ACTOR": null,
+      "DETAIL": "{\n  \"model\": \"claude-opus-5-5\",\n  \"seconds\": 11.5\n}"
+    },
+    {
+      "ACTION_TYPE": "APPROVED",
+      "ACTED_AT": "2026-10-23 16:19:19.516000",
+      "ACTOR": null,
+      "DETAIL": "{\n  \"new_holds\": 2,\n  \"total_holds\": 2,\n  \"units\": 125\n}"
+    },
+    {
+      "ACTION_TYPE": "ORDER_BLOCKED",
+      "ACTED_AT": "2026-10-23 16:19:53.028000",
+      "ACTOR": null,
+      "DETAIL": "{\n  \"order_id\": \"O-101\"\n}"
+    }
+  ],
+  "order_actions": [
+    {
+      "ACTION_TYPE": "ORDER_BLOCKED",
+      "ACTED_AT": "2026-10-23 16:19:53.028000",
+      "ACTOR": null,
+      "DETAIL": "{\n  \"order_id\": \"O-101\"\n}"
+    },
+    {
+      "ACTION_TYPE": "ORDER_FULFILLED",
+      "ACTED_AT": "2026-10-23 16:20:24.168000",
+      "ACTOR": null,
+      "DETAIL": "{\n  \"order_id\": \"O-110\"\n}"
+    }
+  ]
+}
