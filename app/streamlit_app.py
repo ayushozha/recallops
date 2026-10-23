@@ -6,6 +6,7 @@ import time
 import uuid
 from pathlib import Path
 
+import plotly.graph_objects as go
 import pydeck as pdk
 import streamlit as st
 
@@ -147,17 +148,18 @@ def us_map_3d(highlight, counts, origin=None, flows=()):
                     tooltip={"html": "<b>{name}{site}</b><br/>{count}{units} {status}<br/>{lot}"})
 
 
-def knowledge_graph(rec, scope, hits, orders):
-    """Notice -> Claude scope -> product -> lots -> stock at each location -> orders, coloured by outcome."""
+def knowledge_graph(rec, scope, hits, orders, stage=6, flash=None):
+    """Notice -> scope -> product -> lots -> stock -> orders. `stage` limits depth for the grow animation;
+    `flash` rings the order node that just changed."""
     q = lambda s: '"' + str(s).replace('"', "'").replace(chr(10), "\\n") + '"'
-    g = ['digraph G { rankdir=LR; bgcolor="transparent"; nodesep=0.25; ranksep=0.6;',
-         'node [shape=box style="rounded,filled" fontname="Helvetica" fontsize=12 penwidth=0 margin="0.18,0.1"];',
-         'edge [color="#9AA5B5" arrowsize=0.7];',
-         f'notice [label={q("FDA notice" + chr(92) + "n" + rec["RECALL_NUMBER"])} fillcolor="#14213D" fontcolor="#FAF8F4"];',
-         f'claude [label={q("Reviewed scope" + chr(92) + "n" + str(len(scope["upcs"])) + " UPC · " + str(len(scope["lot_codes"])) + " lots")} fillcolor="#D97757" fontcolor="#14213D"];',
-         'notice -> claude;']
+    g = []
+    add = lambda lvl, line: g.append(line) if lvl <= stage else None
+    add(1, f'notice [label={q("FDA notice" + chr(10) + rec["RECALL_NUMBER"])} fillcolor="#14213D" fontcolor="#FAF8F4"];')
+    add(2, f'claude [label={q("Reviewed scope" + chr(10) + str(len(scope["upcs"])) + " UPC · " + str(len(scope["lot_codes"])) + " lots")} fillcolor="#D97757" fontcolor="#14213D"];')
+    add(2, 'notice -> claude;')
     for u in scope["upcs"]:
-        g += [f'u{u} [label={q("UPC " + u)} fillcolor="#FBEDE6" fontcolor="#14213D"];', f'claude -> u{u};']
+        add(3, f'u{u} [label={q("UPC " + u)} fillcolor="#FBEDE6" fontcolor="#14213D"];')
+        add(3, f'claude -> u{u};')
     lots_done = set()
     for r in hits:
         inv, lot = r["INVENTORY_ID"], r["LOT"]
@@ -166,25 +168,75 @@ def knowledge_graph(rec, scope, hits, orders):
                            ("#D97757", "#14213D", "affected") if dec == "Affected" else
                            ("#F5C66B", "#14213D", "needs review") if dec.startswith("Needs") else
                            ("#E3F4FB", "#0C5A7D", "outside scope"))
-        g.append(f'{q(inv)} [label={q(r["LOCATION"] + chr(10) + str(r["UNITS"]) + " units · " + tag)} fillcolor="{fill}" fontcolor="{font}"];')
+        add(5, f'{q(inv)} [label={q(r["LOCATION"] + chr(10) + str(r["UNITS"]) + " units · " + tag)} fillcolor="{fill}" fontcolor="{font}"];')
         if lot:
             lid = "lot_" + (str(r["UPC"]) + "\0" + str(lot)).encode("utf-8").hex()
             if lid not in lots_done:
                 lots_done.add(lid)
                 in_scope = dec != "Not affected: lot outside scope"
-                g.append(f'{lid} [label={q("Lot " + lot)} shape=ellipse fillcolor="{"#F7D3C4" if in_scope else "#E3F4FB"}" fontcolor="#14213D"];')
-                g.append(f'u{r["UPC"]} -> {lid};')
-            g.append(f'{lid} -> {q(inv)};')
+                add(4, f'{lid} [label={q("Lot " + lot)} shape=ellipse fillcolor="{"#F7D3C4" if in_scope else "#E3F4FB"}" fontcolor="#14213D"];')
+                add(4, f'u{r["UPC"]} -> {lid};')
+            add(5, f'{lid} -> {q(inv)};')
         else:
-            g.append(f'u{r["UPC"]} -> {q(inv)} [style=dashed label="no lot" fontsize=10 fontcolor="#7A5300"];')
+            add(5, f'u{r["UPC"]} -> {q(inv)} [style=dashed label="no lot" fontsize=10 fontcolor="#7A5300"];')
     hit_ids = {r["INVENTORY_ID"] for r in hits}
     for o in orders:
         if o["INVENTORY_ID"] in hit_ids:
             fill, font = {"BLOCKED": ("#9B2C22", "#FFFFFF"), "FULFILLED": ("#1E6A36", "#FFFFFF")}.get(
                 o["STATUS"], ("#ECEEF2", "#3D4552"))
-            g.append(f'{q(o["ORDER_ID"])} [label={q(o["ORDER_ID"] + chr(10) + o["STATUS"].lower() + " → " + o["DESTINATION"])} shape=note fillcolor="{fill}" fontcolor="{font}"];')
-            g.append(f'{q(o["INVENTORY_ID"])} -> {q(o["ORDER_ID"])};')
-    return "\n".join(g + ["}"])
+            ring = ' penwidth=5 color="#F5C66B"' if o["ORDER_ID"] == flash else ""
+            label = o["ORDER_ID"] + chr(10) + {"BLOCKED": "BLOCKED", "FULFILLED": "FULFILLED"}.get(o["STATUS"], "pending") + " → " + o["DESTINATION"]
+            add(6, f'{q(o["ORDER_ID"])} [label={q(label)} shape=note fillcolor="{fill}" fontcolor="{font}"{ring}];')
+            add(6, f'{q(o["INVENTORY_ID"])} -> {q(o["ORDER_ID"])};')
+    head = ['digraph G { rankdir=LR; bgcolor="transparent"; nodesep=0.25; ranksep=0.6;',
+            'node [shape=box style="rounded,filled" fontname="Helvetica" fontsize=12 penwidth=0 margin="0.18,0.1"];',
+            'edge [color="#9AA5B5" arrowsize=0.7];']
+    return "\n".join(head + g + ["}"])
+
+
+@st.cache_data(ttl=600)
+def weekly_recalls():
+    return query(get_conn(), """SELECT DATE_TRUNC('week', REPORT_DATE) WK, CLASSIFICATION K, COUNT(*) N
+                               FROM FDA_RECALLS WHERE REPORT_DATE IS NOT NULL GROUP BY 1, 2 ORDER BY 1""")
+
+
+def trends_chart(rows, marked_date):
+    fig = go.Figure()
+    for k, color in [("Class I", "#B4532F"), ("Class II", "#D97757"), ("Class III", "#F3C7B4")]:
+        pts = [r for r in rows if r["K"] == k]
+        fig.add_bar(x=[r["WK"] for r in pts], y=[r["N"] for r in pts], name=k, marker_color=color,
+                    hovertemplate="week of %{x|%b %d, %Y}: %{y} " + k + " recalls<extra></extra>")
+    if marked_date:
+        fig.add_vline(x=marked_date, line_width=2, line_dash="dot", line_color="#14213D")
+        fig.add_annotation(x=marked_date, y=1, yref="paper", text="this recall", showarrow=False,
+                           yanchor="bottom", font=dict(color="#14213D", size=12))
+    fig.update_layout(barmode="stack", height=200, margin=dict(l=0, r=0, t=24, b=0), bargap=0.15,
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      legend=dict(orientation="h", y=1.2, x=0, xanchor="left"),
+                      yaxis=dict(title="recalls / week", gridcolor="#ECEAE4"), xaxis=dict(showgrid=False))
+    return fig
+
+
+def findings_lines(rec, out):
+    lines = [f"🔎 Reading FDA notice **{rec['RECALL_NUMBER']}** inside Snowflake Cortex…",
+             f"🏭 Recalling firm: **{out.get('firm', '?')}**"]
+    lines += [f"🏷️ Found UPC **{u}**" for u in out.get("upcs", [])]
+    lines += [f"📦 Lot **{l}**: in scope" for l in out.get("lot_codes", [])]
+    for a in out.get("ambiguities", [])[:3]:
+        first = re.split(r"(?<=[.;])\s", a)[0]
+        lines.append(f"⚠️ {first[:140]}")
+    lines.append(f"✅ Scope ready for human review: {len(out.get('upcs', []))} UPC, {len(out.get('lot_codes', []))} lots")
+    return lines
+
+
+def typed(lines):
+    for line in lines:
+        for w in line.split(" "):
+            yield w + " "
+            time.sleep(0.035)
+        yield "  \n"
+        time.sleep(0.25)
+
 
 st.set_page_config(page_title="RecallOps", page_icon="🛑", layout="wide")
 
@@ -269,6 +321,7 @@ if st.session_state.get("recall") != rec["RECALL_NUMBER"]:
     st.session_state.recall = rec["RECALL_NUMBER"]
     st.session_state.pop("case", None)
     st.session_state.pop("approve_result", None)
+    st.session_state.pop("t_hold", None)
 case = st.session_state.get("case")
 status = query(conn, "SELECT STATUS FROM RECALL_CASES WHERE CASE_ID = %(c)s", {"c": case["id"]})[0]["STATUS"] \
     if case else None
@@ -283,6 +336,34 @@ h2.markdown("<div style='text-align:right;padding-top:8px'>" + (
     pill("Holds approved", "green") if status == "APPROVED" else
     pill("Scope awaiting review", "amber") if case else pill("Not yet interpreted")) + "</div>",
     unsafe_allow_html=True)
+
+@st.fragment(run_every="1s")
+def response_banner():
+    c = st.session_state.get("case")
+    if not c or "t0" not in c:
+        return
+    done = st.session_state.get("t_hold")
+    secs = int((done or time.time()) - c["t0"])
+    units = (st.session_state.get("approve_result") or {}).get("units_held", 0) if done else 0
+    clock = f"{secs // 60:02d}:{secs % 60:02d}"
+    state = "holds approved · stock stopped" if done else "awaiting review and approval"
+    count = (f'<span class="rb-count" style="--target:{units}"></span>' if units else "0")
+    st.markdown(f"""<style>@property --n {{syntax:'<integer>'; initial-value:0; inherits:false}}
+.rb {{display:flex; gap:36px; align-items:center; background:linear-gradient(90deg,#14213D,#23365C); color:#FAF8F4;
+  border-radius:14px; padding:14px 26px; margin:6px 0 14px;}}
+.rb b {{font-size:30px; font-variant-numeric:tabular-nums}} .rb small {{color:#C3CCD8; font-size:13px; letter-spacing:1px; text-transform:uppercase}}
+.rb-dot {{width:10px; height:10px; border-radius:50%; background:{"#4ADE80" if done else "#F5C66B"}; display:inline-block; margin-right:8px;
+  box-shadow:0 0 12px {"#4ADE80" if done else "#F5C66B"}}}
+.rb-count {{animation: rbc 1.8s ease-out forwards; counter-reset: n var(--n)}} .rb-count::after {{content: counter(n)}}
+@keyframes rbc {{from {{--n:0}} to {{--n:var(--target)}}}}</style>
+<div class="rb"><div><small>Notice → holds</small><br><b>⏱ {clock}</b></div>
+<div><small>Units protected</small><br><b style="color:#F0A58A">{count}</b></div>
+<div><small>Status</small><br><span class="rb-dot"></span>{state}</div>
+<div style="margin-left:auto;text-align:right"><small>Measured live · case</small><br>{html.escape(c["id"])}</div></div>""",
+                unsafe_allow_html=True)
+
+
+response_banner()
 
 tab1, tabmap, tab2, tab3, tab4 = st.tabs(
     ["1 The notice", "2 Where it went", "3 What we found", "4 Lock it down", "5 Audit trail"])
@@ -311,6 +392,7 @@ with tab1:
         if st.button("Interpret with Claude", type="primary", use_container_width=True):
             with st.spinner("Claude is reading the notice inside Snowflake…"):
                 t0 = time.time()
+                st.session_state.pop("t_hold", None)
                 out = interpret(conn, notice)
                 secs = time.time() - t0
             case_id = "CASE-" + uuid.uuid4().hex[:8].upper()
@@ -319,11 +401,17 @@ with tab1:
                   {"c": case_id, "r": rec["RECALL_NUMBER"], "n": notice, "m": MODEL, "o": json.dumps(out)})
             query(conn, "INSERT INTO ACTIONS (CASE_ID, ACTION_TYPE, DETAIL) SELECT %(c)s, 'INTERPRETED', PARSE_JSON(%(d)s)",
                   {"c": case_id, "d": json.dumps({"seconds": round(secs, 1), "model": MODEL})})
-            st.session_state.case = {"id": case_id, "out": out, "secs": secs}
+            st.session_state.case = {"id": case_id, "out": out, "secs": secs, "t0": t0}
+            st.session_state.stream_findings = True
             st.session_state.pop("approve_result", None)
             st.rerun()
         if case:
             out = case["out"]
+            st.markdown("**Claude's findings**")
+            if st.session_state.pop("stream_findings", False):
+                st.write_stream(typed(findings_lines(rec, out)))
+            else:
+                st.markdown("  \n".join(findings_lines(rec, out)))
             st.markdown(f"""<div class="ro-kv">
 <div>Firm</div><div>{html.escape(out.get('firm', ''))}</div>
 <div>Products</div><div>{'<br>'.join(html.escape(p) for p in out.get('product_names', []))}</div>
@@ -360,6 +448,9 @@ with tabmap:
                     pill(f"{len(flows)} shipments into our network", "amber") +
                     (pill(f"{held_u} units stopped", "red") if held_u else "") +
                     pill(f"{moving} units still moving", "green" if held_u else "amber"), unsafe_allow_html=True)
+    st.markdown("**FDA food recalls per week** — it never stops")
+    st.plotly_chart(trends_chart(weekly_recalls(), rec["REPORT_DATE"]), use_container_width=True,
+                    config={"displayModeBar": False})
     st.pydeck_chart(us_map_3d(shipped, counts, origin, flows), use_container_width=True, height=600)
     st.caption(f"Coral: states inferred for {rec['RECALL_NUMBER']}. Height and blue shade: counts inferred from "
                f"{n_total:,} FDA distribution patterns. This approximate text parser includes DC and can miss or "
@@ -406,8 +497,17 @@ with tab2:
     graph_orders = query(conn, """SELECT o.ORDER_ID, o.INVENTORY_ID, o.DESTINATION, o.STATUS FROM ORDERS o
                                   ORDER BY o.ORDER_ID""")
     if hits:
-        st.markdown("**Recall knowledge graph** — notice → reviewed scope → product → lots → stock → orders")
-        st.graphviz_chart(knowledge_graph(rec, scope, hits, graph_orders), use_container_width=True)
+        g1, g2 = st.columns([5, 1])
+        g1.markdown("**Recall knowledge graph** — notice → reviewed scope → product → lots → stock → orders")
+        trace = g2.button("▶ Trace the recall", use_container_width=True)
+        graph_slot = st.empty()
+        if trace:  # grow the graph one layer at a time
+            for stage in range(1, 7):
+                graph_slot.graphviz_chart(knowledge_graph(rec, scope, hits, graph_orders, stage), use_container_width=True)
+                time.sleep(0.55)
+        else:
+            graph_slot.graphviz_chart(knowledge_graph(rec, scope, hits, graph_orders, flash=st.session_state.get("flash")),
+                                      use_container_width=True)
         with st.expander("Matched inventory rows"):
             st.dataframe(hits, use_container_width=True, hide_index=True)
     if not hits:
@@ -435,6 +535,11 @@ with tab3:
             query(conn, "UPDATE RECALL_CASES SET REVIEWED_SCOPE = PARSE_JSON(%(s)s) WHERE CASE_ID = %(c)s",
                   {"s": json.dumps(scope), "c": case["id"]})
             st.session_state.approve_result = call("CALL APPROVE_HOLDS(%(c)s)", {"c": case["id"]})
+            if "t0" in case and not st.session_state.get("t_hold"):
+                st.session_state.t_hold = time.time()
+                query(conn, "INSERT INTO ACTIONS (CASE_ID, ACTION_TYPE, DETAIL) SELECT %(c)s, 'NOTICE_TO_HOLD', PARSE_JSON(%(d)s)",
+                      {"c": case["id"], "d": json.dumps({"seconds": round(st.session_state.t_hold - case["t0"], 1),
+                                                          "units": st.session_state.approve_result.get("units_held")})})
             st.rerun()
         if st.session_state.get("approve_result"):
             r = st.session_state.approve_result
@@ -460,7 +565,14 @@ with tab3:
 {pill(label, tone)}""", unsafe_allow_html=True)
             if b.button("Try order", key=o["ORDER_ID"]):
                 call("CALL FULFILL_ORDER(%(o)s)", {"o": o["ORDER_ID"]})
+                st.session_state.flash = o["ORDER_ID"]
                 st.rerun()
+
+    if hits:
+        st.markdown("**Live recall graph** — order nodes flip the moment Snowflake decides")
+        live_orders = query(conn, "SELECT ORDER_ID, INVENTORY_ID, DESTINATION, STATUS FROM ORDERS ORDER BY ORDER_ID")
+        st.graphviz_chart(knowledge_graph(rec, scope, hits, live_orders, flash=st.session_state.get("flash")),
+                          use_container_width=True)
 
 # ---------- 4: audit ----------
 with tab4:
