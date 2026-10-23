@@ -1,0 +1,5 @@
+name: recallops
+channels:
+  - snowflake
+dependencies:
+  - snowflake-snowpark-python

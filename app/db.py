@@ -3,14 +3,24 @@ import os
 from pathlib import Path
 
 import snowflake.connector
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:  # Streamlit in Snowflake has no .env
+    pass
 
 MODEL = os.getenv("RECALLOPS_MODEL", "claude-sonnet-4-5")
 
 
 def connect():
+    if not os.getenv("SNOWFLAKE_ACCOUNT"):
+        # Running as Streamlit in Snowflake: reuse the app's own session
+        from snowflake.snowpark.context import get_active_session
+
+        conn = get_active_session().connection
+        conn.cursor().execute("USE SCHEMA RECALLOPS.APP")
+        return conn
     return snowflake.connector.connect(
         account=os.environ["SNOWFLAKE_ACCOUNT"],
         user=os.environ["SNOWFLAKE_USER"],
