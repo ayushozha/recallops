@@ -1,0 +1,58 @@
+Connected: {'U': 'USER', 'R': 'ATTENDEE_ROLE', 'G': 'AWS_US_WEST_2'}
+PASS Claude reachable via AI_COMPLETE - claude-opus-5-5
+
+Notice:
+Recalling firm: Everything Sprouts, LLC
+Recall number: H-1339-2026 (Class I)
+Product: Everything Sprouts Crunchy Protein Sprout Mix, containing Alfalfa Fenugreek, Cabbage, Mung, Adzuki, Lentils, Green Pea, Net Wt. 5.0 oz (142 g) UPC 0 87906-01018 7.  everythingsprouts.com
+Code info: Lot# 222, 223, 226, 230
+Reason: Sprouts may be contaminated with STEC E. coli and/or Salmonella.
+Distribution: MN, WI
+
+Claude scope (12.1s): {
+ "firm": "Everything Sprouts, LLC",
+ "product_names": [
+  "Everything Sprouts Crunchy Protein Sprout Mix, Net Wt. 5.0 oz (142 g)"
+ ],
+ "upcs": [
+  "087906010187"
+ ],
+ "lot_codes": [
+  "222",
+  "223",
+  "226",
+  "230"
+ ],
+ "best_by_dates": [],
+ "reason": "Sprouts may be contaminated with STEC E. coli and/or Salmonella.",
+ "evidence": [
+  "UPC 0 87906-01018 7",
+  "Code info: Lot# 222, 223, 226, 230",
+  "Recall number: H-1339-2026 (Class I)",
+  "Distribution: MN, WI"
+ ],
+ "ambiguities": [
+  "The UPC check digit does not validate. The notice shows 0 87906-01018 7, but the GS1 check digit calculated from the first 11 digits is 0, not 7. Verify the UPC against the physical package or supplier records before matching in POS or inventory systems.",
+  "Lot codes 222, 223, 226 and 230 are 3-digit numbers that may be Julian day-of-year production codes (around Aug 10-18). Confirm how the lot code appears on the package.",
+  "The lots are listed individually, not as a range. Lots 224, 225 and 227-229 are not listed and are presumed out of scope. Confirm with the supplier.",
+  "No best-by or use-by dates are provided.",
+  "The ingredient list reads 'Alfalfa Fenugreek' without a comma. This is likely a typo with no effect on scope.",
+  "Distribution is listed as MN and WI only. Check whether the chain received product through distributors in other states."
+ ]
+}
+PASS Claude returned explicit UPC and lot scope
+PASS Claude found the recalled UPC - ['087906010187']
+PASS Claude includes the affected fixture lot - ['222', '223', '226', '230']
+PASS Claude excludes the control fixture lot
+PASS Claude lot scope matches the labelled fixture - ['222', '223', '226', '230'] vs ['222', '223', '226', '230']
+PASS APPROVE_HOLDS placed holds - {'new_holds': 2, 'total_holds': 2, 'units_held': 125}
+PASS Re-approval is idempotent - {'new_holds': 0, 'total_holds': 2, 'units_held': 125}
+PASS No NULL-lot rows silently held
+PASS Control lots stay unheld
+PASS Order O-101 has expected hold - 1
+PASS Order O-101 BLOCKED - {'hold_case': 'VERIFY-873E22', 'order_id': 'O-101', 'result': 'BLOCKED'}
+PASS Order O-110 has expected hold
+PASS Order O-110 FULFILLED - {'order_id': 'O-110', 'result': 'FULFILLED'}
+PASS Actions audited - 3
+
+15/15 checks passed · case VERIFY-873E22 · Claude 12.1s · model claude-opus-5-5

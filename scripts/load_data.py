@@ -3,6 +3,7 @@
 Usage: .venv/bin/python scripts/load_data.py [--dry-run] [--skip-setup] [--keep-cases]
 """
 import argparse
+import fcntl
 import json
 import random
 import re
@@ -132,8 +133,16 @@ def main():
     ap.add_argument("--skip-setup", action="store_true")
     ap.add_argument("--keep-cases", action="store_true")
     a = ap.parse_args()
-    records = fetch()
-    fda_rows = [tuple((r.get(f) or None) for f in FIELDS) + (json.dumps(r),) for r in records]
+    fetched = fetch()
+    records = [r for r in fetched if str(r.get("recall_number") or "").strip()]
+    print("FDA source reports: fetched %d, skipped %d without recall_number, usable %d" %
+          (len(fetched), len(fetched) - len(records), len(records)))
+    seen = set()
+    fda_rows = []
+    for r in records:  # skip reports without a recall number and duplicates across pages
+        if r.get("recall_number") and r["recall_number"] not in seen:
+            seen.add(r["recall_number"])
+            fda_rows.append(tuple((r.get(f) or None) for f in FIELDS) + (json.dumps(r),))
     chosen, locs, inv, orders = build(records)
     counts = {"FDA_RECALLS": len(fda_rows), "LOCATIONS": len(locs), "INVENTORY": len(inv), "ORDERS": len(orders)}
     if a.dry_run:
@@ -144,7 +153,8 @@ def main():
             print("  ORD", o)
     else:
         from db import connect
-        conn = connect()
+        # The first load creates RECALLOPS.APP, so it cannot be selected at login.
+        conn = connect(select_schema=False)
         if not a.skip_setup:
             conn.execute_string((ROOT / "sql" / "01_setup.sql").read_text())
         cur = conn.cursor()
@@ -162,9 +172,22 @@ def main():
                                   "QUANTITY", "SOURCE_RECALL_NUMBER"], inv,
                "column1, column2, column3, column4, column5, column6::STRING, column7::NUMBER, column8")
         insert(cur, "ORDERS", ["ORDER_ID", "INVENTORY_ID", "QUANTITY", "DESTINATION", "STATUS"], orders)
+        keys = {"FDA_RECALLS": "RECALL_NUMBER", "LOCATIONS": "LOCATION_ID",
+                "INVENTORY": "INVENTORY_ID", "ORDERS": "ORDER_ID"}
+        failures = []
         for t in tables:
-            counts[t] = cur.execute("SELECT COUNT(*) FROM " + t).fetchone()[0]
+            if t in keys:
+                total, unique = cur.execute(
+                    "SELECT COUNT(*), COUNT(DISTINCT %s) FROM %s" % (keys[t], t)).fetchone()
+                if total != counts[t] or unique != total:
+                    failures.append("%s: expected %d rows, got %d rows / %d unique IDs" %
+                                    (t, counts[t], total, unique))
+                counts[t] = total
+            else:
+                counts[t] = cur.execute("SELECT COUNT(*) FROM " + t).fetchone()[0]
         conn.close()
+        if failures:
+            raise RuntimeError("Load verification failed: " + "; ".join(failures))
     print("\nRow counts:", counts)
     print("\nRecalls that hit our inventory (%d):" % len(chosen))
     for rec, upc, lotl in chosen:
@@ -172,5 +195,15 @@ def main():
                                                    ",".join(lotl), short_name(rec["product_description"])[:45]))
 
 
+def run_locked():
+    # Keep the file in place: unlinking it would allow two different lock files.
+    with (ROOT / ".recallops-load.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("Another RecallOps loader is running. Wait for it to finish before retrying.")
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    run_locked()
